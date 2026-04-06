@@ -74,4 +74,5 @@ export default await Env.create(new URL('../', import.meta.url), {
   NOMAD_EMBED_RETRY_DELAY: Env.schema.number.optional(),
   NOMAD_QUEUE_LOCK_DURATION: Env.schema.number.optional(),
   NOMAD_EMBED_CONCURRENCY: Env.schema.number.optional(),
+  NOMAD_CHAR_TO_TOKEN_RATIO: Env.schema.number.optional(),
 })
