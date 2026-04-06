@@ -20,7 +20,7 @@ import * as cheerio from 'cheerio'
 import { OllamaService } from './ollama_service.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import { removeStopwords } from 'stopword'
-import { randomUUID } from 'node:crypto'
+import { createHash } from 'node:crypto'
 import { join, resolve, sep } from 'node:path'
 import KVStore from '#models/kv_store'
 import { ZIMExtractionService } from './zim_extraction_service.js'
@@ -118,6 +118,18 @@ export class RagService {
    * - Invalid Unicode sequences
    * - Control characters (except newlines, tabs, and carriage returns)
    */
+  private generatePointId(chunkText: string, chunkIndex: number, source: string): string {
+    const hash = createHash('sha256').update(`${source}:${chunkIndex}:${chunkText}`).digest('hex')
+    // Qdrant accepts UUIDs: format the first 32 hex chars as UUID v4 shape
+    return [
+      hash.slice(0, 8),
+      hash.slice(8, 12),
+      hash.slice(12, 16),
+      hash.slice(16, 20),
+      hash.slice(20, 32),
+    ].join('-')
+  }
+
   private sanitizeText(text: string): string {
     return (
       text
@@ -415,7 +427,7 @@ export class RagService {
           : 'unknown'
 
       return {
-        id: randomUUID(),
+        id: this.generatePointId(item.text, index, sanitizedSource),
         vector: embeddings[index],
         payload: {
           ...item.metadata,
@@ -444,7 +456,7 @@ export class RagService {
     text: string,
     metadata: Record<string, any> = {},
     onProgress?: (percent: number) => Promise<void>
-  ): Promise<{ chunks: number } | null> {
+  ): Promise<{ chunks: number; failedChunks: number } | null> {
     try {
       await this._ensureCollection(
         RagService.CONTENT_COLLECTION_NAME,
@@ -520,84 +532,97 @@ export class RagService {
         prefixedChunks.push(RagService.SEARCH_DOCUMENT_PREFIX + chunkText)
       }
 
-      // Batch embed chunks for performance
-      const embeddings: number[][] = []
+      // Batch embed and upsert chunks with per-batch error isolation
       const batchSize = RagService.EMBEDDING_BATCH_SIZE
       const totalBatches = Math.ceil(prefixedChunks.length / batchSize)
+      const timestamp = Date.now()
+      const source =
+        typeof metadata.source === 'string' ? this.sanitizeText(metadata.source) : 'unknown'
+      let succeededChunks = 0
+      let failedChunks = 0
 
       for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
         const batchStart = batchIdx * batchSize
-        const batch = prefixedChunks.slice(batchStart, batchStart + batchSize)
+        const batchPrefixed = prefixedChunks.slice(batchStart, batchStart + batchSize)
+        const batchChunks = chunks.slice(batchStart, batchStart + batchSize)
 
-        logger.debug(
-          `[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batch.length} chunks)`
-        )
+        try {
+          logger.debug(
+            `[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batchPrefixed.length} chunks)`
+          )
 
-        const response = await this.ollamaService.embed(
-          this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL,
-          batch
-        )
+          const response = await this.ollamaService.embed(
+            this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL,
+            batchPrefixed
+          )
 
-        embeddings.push(...response.embeddings)
+          const points = batchChunks.map((chunkText, i) => {
+            const globalIndex = batchStart + i
+            const sanitizedText = this.sanitizeText(chunkText)
+            const contentKeywords = this.extractKeywords(sanitizedText)
+
+            let structuralKeywords: string[] = []
+            if (metadata.full_title) {
+              structuralKeywords = this.extractKeywords(metadata.full_title as string)
+            } else if (metadata.article_title) {
+              structuralKeywords = this.extractKeywords(metadata.article_title as string)
+            }
+
+            const allKeywords = [...new Set([...structuralKeywords, ...contentKeywords])]
+
+            logger.debug(
+              `[RAG] Extracted keywords for chunk ${globalIndex}: [${allKeywords.join(', ')}]`
+            )
+            if (structuralKeywords.length > 0) {
+              logger.debug(
+                `[RAG]   - Structural: [${structuralKeywords.join(', ')}], Content: [${contentKeywords.join(', ')}]`
+              )
+            }
+
+            return {
+              id: this.generatePointId(chunkText, globalIndex, source),
+              vector: response.embeddings[i],
+              payload: {
+                ...metadata,
+                text: sanitizedText,
+                chunk_index: globalIndex,
+                total_chunks: chunks.length,
+                keywords: allKeywords.join(' '),
+                char_count: sanitizedText.length,
+                created_at: timestamp,
+                source,
+              },
+            }
+          })
+
+          await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, { points })
+          succeededChunks += batchChunks.length
+        } catch (batchError) {
+          failedChunks += batchChunks.length
+          const preview = batchChunks[0]?.substring(0, 80) ?? '(empty)'
+          logger.error(
+            `[RAG] Batch ${batchIdx + 1}/${totalBatches} failed (chunks ${batchStart}-${batchStart + batchChunks.length - 1}), preview: "${preview}..."`,
+            batchError
+          )
+        }
 
         if (onProgress) {
-          const progress = ((batchStart + batch.length) / prefixedChunks.length) * 100
+          const progress = ((batchStart + batchPrefixed.length) / prefixedChunks.length) * 100
           await onProgress(progress)
         }
       }
 
-      const timestamp = Date.now()
-      const points = chunks.map((chunkText, index) => {
-        // Sanitize text to prevent JSON encoding errors
-        const sanitizedText = this.sanitizeText(chunkText)
+      if (succeededChunks === 0) {
+        logger.error(`[RAG] All ${totalBatches} batches failed, no chunks were embedded`)
+        return null
+      }
 
-        // Extract keywords from content
-        const contentKeywords = this.extractKeywords(sanitizedText)
+      logger.debug(`[RAG] Embedded and stored ${succeededChunks} chunks (${failedChunks} failed)`)
+      if (chunks.length > 0) {
+        logger.debug(`[RAG] First chunk preview: "${chunks[0].substring(0, 100)}..."`)
+      }
 
-        // For ZIM content, also extract keywords from structural metadata
-        let structuralKeywords: string[] = []
-        if (metadata.full_title) {
-          structuralKeywords = this.extractKeywords(metadata.full_title as string)
-        } else if (metadata.article_title) {
-          structuralKeywords = this.extractKeywords(metadata.article_title as string)
-        }
-
-        // Combine and dedup keywords
-        const allKeywords = [...new Set([...structuralKeywords, ...contentKeywords])]
-
-        logger.debug(`[RAG] Extracted keywords for chunk ${index}: [${allKeywords.join(', ')}]`)
-        if (structuralKeywords.length > 0) {
-          logger.debug(
-            `[RAG]   - Structural: [${structuralKeywords.join(', ')}], Content: [${contentKeywords.join(', ')}]`
-          )
-        }
-
-        // Sanitize source metadata as well
-        const sanitizedSource =
-          typeof metadata.source === 'string' ? this.sanitizeText(metadata.source) : 'unknown'
-
-        return {
-          id: randomUUID(), // qdrant requires either uuid or unsigned int
-          vector: embeddings[index],
-          payload: {
-            ...metadata,
-            text: sanitizedText,
-            chunk_index: index,
-            total_chunks: chunks.length,
-            keywords: allKeywords.join(' '), // store as space-separated string for text search
-            char_count: sanitizedText.length,
-            created_at: timestamp,
-            source: sanitizedSource,
-          },
-        }
-      })
-
-      await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, { points })
-
-      logger.debug(`[RAG] Successfully embedded and stored ${chunks.length} chunks`)
-      logger.debug(`[RAG] First chunk preview: "${chunks[0].substring(0, 100)}..."`)
-
-      return { chunks: chunks.length }
+      return { chunks: succeededChunks, failedChunks }
     } catch (error) {
       console.error(error)
       logger.error('[RAG] Error embedding text:', error)
@@ -842,7 +867,7 @@ export class RagService {
     filepath: string,
     deleteAfterEmbedding: boolean = false,
     onProgress?: (percent: number) => Promise<void>
-  ): Promise<{ success: boolean; message: string; chunks?: number }> {
+  ): Promise<{ success: boolean; message: string; chunks?: number; failedChunks?: number }> {
     if (!extractedText || extractedText.trim().length === 0) {
       return {
         success: false,
@@ -867,10 +892,16 @@ export class RagService {
       await deleteFileIfExists(filepath)
     }
 
+    const message =
+      embedResult.failedChunks > 0
+        ? `File processed with partial success: ${embedResult.chunks} chunks embedded, ${embedResult.failedChunks} failed.`
+        : 'File processed and embedded successfully.'
+
     return {
       success: true,
-      message: 'File processed and embedded successfully.',
+      message,
       chunks: embedResult.chunks,
+      failedChunks: embedResult.failedChunks,
     }
   }
 
