@@ -1,6 +1,9 @@
 import { inject } from '@adonisjs/core'
 import OpenAI from 'openai'
-import type { ChatCompletionChunk, ChatCompletionMessageParam } from 'openai/resources/chat/completions.js'
+import type {
+  ChatCompletionChunk,
+  ChatCompletionMessageParam,
+} from 'openai/resources/chat/completions.js'
 import type { Stream } from 'openai/streaming.js'
 import { NomadOllamaModel } from '../../types/ollama.js'
 import { FALLBACK_RECOMMENDED_OLLAMA_MODELS } from '../../constants/ollama.js'
@@ -16,6 +19,7 @@ import { BROADCAST_CHANNELS } from '../../constants/broadcast.js'
 import env from '#start/env'
 import { NOMAD_API_DEFAULT_BASE_URL } from '../../constants/misc.js'
 import KVStore from '#models/kv_store'
+import pipelineConfig from '#config/pipeline'
 
 const NOMAD_MODELS_API_PATH = '/api/v1/ollama/models'
 const MODELS_CACHE_FILE = path.join(process.cwd(), 'storage', 'ollama-models-cache.json')
@@ -139,7 +143,9 @@ export class OllamaService {
             try {
               const parsed = JSON.parse(line)
               if (parsed.completed && parsed.total) {
-                const percent = parseFloat(((parsed.completed / parsed.total) * 100).toFixed(2))
+                const percent = Number.parseFloat(
+                  ((parsed.completed / parsed.total) * 100).toFixed(2)
+                )
                 this.broadcastDownloadProgress(model, percent)
                 if (progressCallback) progressCallback(percent)
               }
@@ -156,9 +162,7 @@ export class OllamaService {
       return { success: true, message: 'Model downloaded successfully.' }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error)
-      logger.error(
-        `[OllamaService] Failed to download model "${model}": ${errorMessage}`
-      )
+      logger.error(`[OllamaService] Failed to download model "${model}": ${errorMessage}`)
 
       // Check for version mismatch (Ollama 412 response)
       const isVersionMismatch = errorMessage.includes('newer version of Ollama')
@@ -246,7 +250,9 @@ export class OllamaService {
       params.num_ctx = chatRequest.numCtx
     }
 
-    const stream = (await this.openai.chat.completions.create(params)) as unknown as Stream<ChatCompletionChunk>
+    const stream = (await this.openai.chat.completions.create(
+      params
+    )) as unknown as Stream<ChatCompletionChunk>
 
     // Returns how many trailing chars of `text` could be the start of `tag`
     function partialTagSuffix(tag: string, text: string): number {
@@ -306,7 +312,9 @@ export class OllamaService {
             content: parsedContent,
             thinking: nativeThinking + parsedThinking,
           },
-          done: chunk.choices[0]?.finish_reason !== null && chunk.choices[0]?.finish_reason !== undefined,
+          done:
+            chunk.choices[0]?.finish_reason !== null &&
+            chunk.choices[0]?.finish_reason !== undefined,
         }
       }
     }
@@ -324,7 +332,10 @@ export class OllamaService {
         { model: modelName },
         { timeout: 5000 }
       )
-      return Array.isArray(response.data?.capabilities) && response.data.capabilities.includes('thinking')
+      return (
+        Array.isArray(response.data?.capabilities) &&
+        response.data.capabilities.includes('thinking')
+      )
     } catch {
       // Non-Ollama backends don't expose /api/show — assume no thinking support
       return false
@@ -347,7 +358,10 @@ export class OllamaService {
       logger.error(
         `[OllamaService] Failed to delete model "${modelName}": ${error instanceof Error ? error.message : error}`
       )
-      return { success: false, message: 'Failed to delete model. This may not be an Ollama backend.' }
+      return {
+        success: false,
+        message: 'Failed to delete model. This may not be an Ollama backend.',
+      }
     }
   }
 
@@ -366,7 +380,7 @@ export class OllamaService {
       const response = await axios.post(
         `${this.baseUrl}/api/embed`,
         { model, input },
-        { timeout: 60000 }
+        { timeout: pipelineConfig.embedTimeout }
       )
       // Some backends (e.g. LM Studio) return HTTP 200 for unknown endpoints with an incompatible
       // body — validate explicitly before accepting the result.
@@ -379,7 +393,11 @@ export class OllamaService {
       // Explicitly request float format — some backends (e.g. LM Studio) don't reliably
       // implement the base64 encoding the OpenAI SDK requests by default.
       logger.info('[OllamaService] /api/embed unavailable, falling back to /v1/embeddings')
-      const results = await this.openai.embeddings.create({ model, input, encoding_format: 'float' })
+      const results = await this.openai.embeddings.create({
+        model,
+        input,
+        encoding_format: 'float',
+      })
       return { embeddings: results.data.map((e) => e.embedding as number[]) }
     }
   }
@@ -588,7 +606,7 @@ export class OllamaService {
               : pulls.endsWith('B')
                 ? 1_000_000_000
                 : 1
-          return parseFloat(pulls) * multiplier
+          return Number.parseFloat(pulls) * multiplier
         }
         return parsePulls(b.estimated_pulls) - parsePulls(a.estimated_pulls)
       })
@@ -609,7 +627,7 @@ export class OllamaService {
                   : size.endsWith('TB')
                     ? 1_000
                     : 0
-            return parseFloat(size) * multiplier
+            return Number.parseFloat(size) * multiplier
           }
           return parseSize(a.size) - parseSize(b.size)
         })

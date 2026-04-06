@@ -4,16 +4,17 @@ import { EmbedJobWithProgress } from '../../types/rag.js'
 import { RagService } from '#services/rag_service'
 import { DockerService } from '#services/docker_service'
 import { OllamaService } from '#services/ollama_service'
-import { createHash } from 'crypto'
+import { createHash } from 'node:crypto'
 import logger from '@adonisjs/core/services/logger'
 import fs from 'node:fs/promises'
+import pipelineConfig from '#config/pipeline'
 
 export interface EmbedFileJobParams {
   filePath: string
   fileName: string
   fileSize?: number
   // Batch processing for large ZIM files
-  batchOffset?: number  // Current batch offset (for ZIM files)
+  batchOffset?: number // Current batch offset (for ZIM files)
   totalArticles?: number // Total articles in ZIM (for progress tracking)
   isFinalBatch?: boolean // Whether this is the last batch (prevents premature deletion)
 }
@@ -60,7 +61,9 @@ export class EmbedFileJob {
       const ollamaUrl = await dockerService.getServiceURL('nomad_ollama')
       if (!ollamaUrl) {
         logger.warn('[EmbedFileJob] Ollama is not installed. Skipping embedding for: %s', fileName)
-        throw new UnrecoverableError('Ollama service is not installed. Install AI Assistant to enable file embeddings.')
+        throw new UnrecoverableError(
+          'Ollama service is not installed. Install AI Assistant to enable file embeddings.'
+        )
       }
 
       const existingModels = await ollamaService.getModels()
@@ -72,7 +75,9 @@ export class EmbedFileJob {
       const qdrantUrl = await dockerService.getServiceURL('nomad_qdrant')
       if (!qdrantUrl) {
         logger.warn('[EmbedFileJob] Qdrant is not installed. Skipping embedding for: %s', fileName)
-        throw new UnrecoverableError('Qdrant service is not installed. Install AI Assistant to enable file embeddings.')
+        throw new UnrecoverableError(
+          'Qdrant service is not installed. Install AI Assistant to enable file embeddings.'
+        )
       }
 
       logger.info(`[EmbedFileJob] Services ready. Processing file: ${fileName}`)
@@ -114,9 +119,7 @@ export class EmbedFileJob {
       // For ZIM files with batching, check if more batches are needed
       if (result.hasMoreBatches) {
         const nextOffset = (batchOffset || 0) + (result.articlesProcessed || 0)
-        logger.info(
-          `[EmbedFileJob] Batch complete. Dispatching next batch at offset ${nextOffset}`
-        )
+        logger.info(`[EmbedFileJob] Batch complete. Dispatching next batch at offset ${nextOffset}`)
 
         // Dispatch next batch (not final yet)
         await EmbedFileJob.dispatch({
@@ -128,9 +131,7 @@ export class EmbedFileJob {
         })
 
         // Calculate progress based on articles processed
-        const progress = totalArticles
-          ? Math.round((nextOffset / totalArticles) * 100)
-          : 50
+        const progress = totalArticles ? Math.round((nextOffset / totalArticles) * 100) : 50
 
         await this.safeUpdateProgress(job, progress)
         await job.updateData({
@@ -241,10 +242,10 @@ export class EmbedFileJob {
 
     const job = await queue.add(this.key, params, {
       jobId,
-      attempts: 30,
+      attempts: pipelineConfig.embedMaxRetries,
       backoff: {
         type: 'fixed',
-        delay: 60000, // Check every 60 seconds for service readiness
+        delay: pipelineConfig.embedRetryDelay,
       },
       removeOnComplete: { count: 50 }, // Keep last 50 completed jobs for history
       removeOnFail: { count: 20 }, // Keep last 20 failed jobs for debugging

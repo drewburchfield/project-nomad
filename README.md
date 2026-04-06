@@ -129,6 +129,30 @@ Contributions are welcome and appreciated! Please see [CONTRIBUTING.md](CONTRIBU
 
 Project N.O.M.A.D. is licensed under the [Apache License 2.0](LICENSE).
 
+## Pipeline Tuning (Environment Variables)
+
+The AI embedding pipeline can be tuned via environment variables. This is useful on low-end or CPU-only hardware where the defaults may cause timeouts or resource exhaustion. All variables are optional; if unset, the defaults (shown below) preserve the existing behavior.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NOMAD_EMBED_TIMEOUT` | `60000` | Ollama embed request timeout in ms |
+| `NOMAD_EMBED_BATCH_SIZE` | `8` | Number of texts per embedding batch |
+| `NOMAD_ZIM_BATCH_SIZE` | `50` | ZIM articles processed per batch |
+| `NOMAD_EMBED_CONCURRENCY` | `2` | Parallel embedding workers |
+| `NOMAD_EMBED_MAX_RETRIES` | `30` | Max retry attempts for embed jobs |
+| `NOMAD_EMBED_RETRY_DELAY` | `60000` | Delay between retries in ms |
+| `NOMAD_QUEUE_LOCK_DURATION` | `300000` | BullMQ worker lock duration in ms |
+
+Set these in your `.env` file or pass them as environment variables when starting the application. All values must be positive integers.
+
+**Example for CPU-only hardware:**
+```env
+NOMAD_EMBED_TIMEOUT=180000
+NOMAD_EMBED_BATCH_SIZE=2
+NOMAD_EMBED_CONCURRENCY=1
+NOMAD_QUEUE_LOCK_DURATION=600000
+```
+
 ## Helper Scripts
 Once installed, Project N.O.M.A.D. has a few helper scripts should you ever need to troubleshoot issues or perform maintenance that can't be done through the Command Center. All of these scripts are found in Project N.O.M.A.D.'s install directory, `/opt/project-nomad`
 

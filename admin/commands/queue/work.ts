@@ -8,6 +8,7 @@ import { RunBenchmarkJob } from '#jobs/run_benchmark_job'
 import { EmbedFileJob } from '#jobs/embed_file_job'
 import { CheckUpdateJob } from '#jobs/check_update_job'
 import { CheckServiceUpdatesJob } from '#jobs/check_service_updates_job'
+import pipelineConfig from '#config/pipeline'
 
 export default class QueueWork extends BaseCommand {
   static commandName = 'queue:work'
@@ -61,7 +62,7 @@ export default class QueueWork extends BaseCommand {
         {
           connection: queueConfig.connection,
           concurrency: this.getConcurrencyForQueue(queueName),
-          lockDuration: 300000,
+          lockDuration: pipelineConfig.queueLockDuration,
           autorun: true,
         }
       )
@@ -84,9 +85,7 @@ export default class QueueWork extends BaseCommand {
             const zimService = new ZimService(dockerService)
             await zimService.onWikipediaDownloadComplete(job.data.url, false)
           } catch (e: any) {
-            this.logger.error(
-              `[${queueName}] Failed to update Wikipedia status: ${e.message}`
-            )
+            this.logger.error(`[${queueName}] Failed to update Wikipedia status: ${e.message}`)
           }
         }
       })
@@ -151,7 +150,7 @@ export default class QueueWork extends BaseCommand {
       [RunDownloadJob.queue]: 3,
       [DownloadModelJob.queue]: 2, // Lower concurrency for resource-intensive model downloads
       [RunBenchmarkJob.queue]: 1, // Run benchmarks one at a time for accurate results
-      [EmbedFileJob.queue]: 2, // Lower concurrency for embedding jobs, can be resource intensive
+      [EmbedFileJob.queue]: pipelineConfig.embedConcurrency,
       [CheckUpdateJob.queue]: 1, // No need to run more than one update check at a time
       default: 3,
     }
