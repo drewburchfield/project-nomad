@@ -332,9 +332,12 @@ export class RagService {
       text: string // raw text (for payload)
       prefixed: string // prefixed text (for embedding)
       metadata: Record<string, any>
+      articleChunkIndex: number // per-article chunk index
+      documentId: string // for grouping per-article totals
     }
 
     const prepared: PreparedChunk[] = []
+    const articleChunkCounters = new Map<string, number>() // per-article chunk index tracker
     let failedChunks = 0
 
     for (const zimChunk of zimChunks) {
@@ -385,10 +388,16 @@ export class RagService {
             text = this.truncateToTokenLimit(text, RagService.MAX_SAFE_TOKENS - prefixTokens)
           }
 
+          const docId = zimChunk.documentId
+          const articleIdx = articleChunkCounters.get(docId) ?? 0
+          articleChunkCounters.set(docId, articleIdx + 1)
+
           prepared.push({
             text,
             prefixed: RagService.SEARCH_DOCUMENT_PREFIX + text,
             metadata,
+            articleChunkIndex: articleIdx,
+            documentId: docId,
           })
         }
       } catch (chunkError) {
@@ -403,6 +412,9 @@ export class RagService {
     if (prepared.length === 0) {
       return { totalChunks: 0, failedChunks }
     }
+
+    // Compute per-article total chunk counts for metadata
+    const articleTotalChunks = new Map<string, number>(articleChunkCounters)
 
     // 3. Batch embed all prepared chunks through Ollama
     const embeddings: number[][] = []
@@ -453,8 +465,8 @@ export class RagService {
         payload: {
           ...item.metadata,
           text: sanitizedText,
-          chunk_index: index,
-          total_chunks: prepared.length,
+          chunk_index: item.articleChunkIndex,
+          total_chunks: articleTotalChunks.get(item.documentId) ?? 1,
           keywords: allKeywords.join(' '),
           char_count: sanitizedText.length,
           created_at: timestamp,

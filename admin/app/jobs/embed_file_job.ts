@@ -275,6 +275,9 @@ export class EmbedFileJob {
           jobId,
           message: `Embedding job already ${state} for: ${params.fileName}`,
         }
+      } else {
+        logger.warn(`[EmbedFileJob] Removing job ${jobId} in unexpected state '${state}' for: ${params.fileName}`)
+        await existing.remove()
       }
     }
 
