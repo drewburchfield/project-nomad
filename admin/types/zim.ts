@@ -108,3 +108,9 @@ export type ZIMContentChunk = {
   // Extraction metadata
   strategy: ExtractZIMChunkingStrategy
 }
+
+export type ZIMExtractionResult = {
+  chunks: ZIMContentChunk[]
+  articlesProcessed: number
+  failedArticles: number
+}
