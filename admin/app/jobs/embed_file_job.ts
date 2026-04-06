@@ -104,6 +104,10 @@ export class EmbedFileJob {
 
       if (!result.success) {
         logger.error(`[EmbedFileJob] Failed to process file ${fileName}: ${result.message}`)
+        // Unsupported file types will never succeed on retry — fail immediately
+        if (result.message?.toLowerCase().includes('unsupported')) {
+          throw new UnrecoverableError(result.message)
+        }
         throw new Error(result.message)
       }
 
