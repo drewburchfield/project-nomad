@@ -53,11 +53,13 @@ const pipelineConfig = {
   /** Concurrency for embed queue workers (default: 2) */
   embedConcurrency: positiveInt('NOMAD_EMBED_CONCURRENCY', env.get('NOMAD_EMBED_CONCURRENCY'), 2),
 
-  /** Chars-per-token estimate for chunk sizing (default: 3) */
+  /** Chars-per-token estimate for chunk sizing (default: 2).
+   *  Technical docs tokenize denser than prose (~3 chars/token for prose,
+   *  ~2 for docs with numbers/symbols). Override via env var if needed. */
   charToTokenRatio: positiveInt(
     'NOMAD_CHAR_TO_TOKEN_RATIO',
     env.get('NOMAD_CHAR_TO_TOKEN_RATIO'),
-    3
+    2
   ),
 }
 

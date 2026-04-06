@@ -115,17 +115,20 @@ export class RagService {
   /**
    * Returns true if the knowledge base contains at least one indexed document.
    * Used to short-circuit RAG search and query rewriting when the KB is empty.
+   * Returns false quickly if Qdrant is not initialized yet (avoids blocking chat).
    */
   async hasDocuments(): Promise<boolean> {
     try {
-      await this._ensureDependencies()
-      const collections = await this.qdrant!.getCollections()
+      // Skip if Qdrant client isn't initialized yet (avoids blocking Docker lookup on cold start)
+      if (!this.qdrant) return false
+
+      const collections = await this.qdrant.getCollections()
       const exists = collections.collections.some(
         (col) => col.name === RagService.CONTENT_COLLECTION_NAME
       )
       if (!exists) return false
 
-      const info = await this.qdrant!.getCollection(RagService.CONTENT_COLLECTION_NAME)
+      const info = await this.qdrant.getCollection(RagService.CONTENT_COLLECTION_NAME)
       return (info.points_count || 0) > 0
     } catch {
       return false
@@ -139,8 +142,11 @@ export class RagService {
    * - Invalid Unicode sequences
    * - Control characters (except newlines, tabs, and carriage returns)
    */
-  private generatePointId(chunkText: string, chunkIndex: number, source: string): string {
-    const hash = createHash('sha256').update(`${source}:${chunkIndex}:${chunkText}`).digest('hex')
+  private generatePointId(chunkText: string, chunkIndex: number, source: string, articlePath?: string): string {
+    const key = articlePath
+      ? `${source}:${articlePath}:${chunkIndex}:${chunkText}`
+      : `${source}:${chunkIndex}:${chunkText}`
+    const hash = createHash('sha256').update(key).digest('hex')
     // Qdrant accepts UUIDs: format the first 32 hex chars as UUID v4 shape
     return [
       hash.slice(0, 8),
@@ -416,81 +422,80 @@ export class RagService {
     // Compute per-article total chunk counts for metadata
     const articleTotalChunks = new Map<string, number>(articleChunkCounters)
 
-    // 3. Batch embed all prepared chunks through Ollama
-    const embeddings: number[][] = []
+    // 3. Batch embed and upsert: embed each batch then immediately upsert to Qdrant.
+    //    This avoids accumulating all embeddings in memory and prevents unbounded upserts.
     const batchSize = RagService.EMBEDDING_BATCH_SIZE
     const totalBatches = Math.ceil(prepared.length / batchSize)
+    const timestamp = Date.now()
+    let totalUpserted = 0
 
     for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
       const batchStart = batchIdx * batchSize
-      const batch = prepared.slice(batchStart, batchStart + batchSize).map((p) => p.prefixed)
+      const batchItems = prepared.slice(batchStart, batchStart + batchSize)
 
-      logger.debug(`[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batch.length} chunks)`)
+      logger.debug(`[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batchItems.length} chunks)`)
 
       const embedStart = Date.now()
       const response = await this.ollamaService.embed(
         this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL,
-        batch
+        batchItems.map((p) => p.prefixed)
       )
       logger.info(
         `[RAG] Embed batch ${batchIdx + 1}/${totalBatches} completed in ${Date.now() - embedStart}ms`
       )
 
-      embeddings.push(...response.embeddings)
+      // Build and upsert points for this batch immediately
+      const points = batchItems.map((item, i) => {
+        const sanitizedText = this.sanitizeText(item.text)
+        const contentKeywords = this.extractKeywords(sanitizedText)
+
+        let structuralKeywords: string[] = []
+        if (item.metadata.full_title) {
+          structuralKeywords = this.extractKeywords(item.metadata.full_title as string)
+        } else if (item.metadata.article_title) {
+          structuralKeywords = this.extractKeywords(item.metadata.article_title as string)
+        }
+
+        const allKeywords = [...new Set([...structuralKeywords, ...contentKeywords])]
+        const sanitizedSource =
+          typeof item.metadata.source === 'string'
+            ? this.sanitizeText(item.metadata.source)
+            : 'unknown'
+
+        return {
+          id: this.generatePointId(item.text, item.articleChunkIndex, sanitizedSource, item.metadata.article_path),
+          vector: response.embeddings[i],
+          payload: {
+            ...item.metadata,
+            text: sanitizedText,
+            chunk_index: item.articleChunkIndex,
+            total_chunks: articleTotalChunks.get(item.documentId) ?? 1,
+            keywords: allKeywords.join(' '),
+            char_count: sanitizedText.length,
+            created_at: timestamp,
+            source: sanitizedSource,
+          },
+        }
+      })
+
+      const upsertStart = Date.now()
+      await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, { points })
+      totalUpserted += points.length
+      logger.info(
+        `[RAG] Qdrant upsert of ${points.length} points completed in ${Date.now() - upsertStart}ms`
+      )
 
       if (onProgress) {
-        const progress = ((batchStart + batch.length) / prepared.length) * 100
+        const progress = ((batchStart + batchItems.length) / prepared.length) * 100
         await onProgress(progress)
       }
     }
 
-    // 4. Build Qdrant points with per-chunk metadata
-    const timestamp = Date.now()
-    const points = prepared.map((item, index) => {
-      const sanitizedText = this.sanitizeText(item.text)
-      const contentKeywords = this.extractKeywords(sanitizedText)
-
-      let structuralKeywords: string[] = []
-      if (item.metadata.full_title) {
-        structuralKeywords = this.extractKeywords(item.metadata.full_title as string)
-      } else if (item.metadata.article_title) {
-        structuralKeywords = this.extractKeywords(item.metadata.article_title as string)
-      }
-
-      const allKeywords = [...new Set([...structuralKeywords, ...contentKeywords])]
-      const sanitizedSource =
-        typeof item.metadata.source === 'string'
-          ? this.sanitizeText(item.metadata.source)
-          : 'unknown'
-
-      return {
-        id: this.generatePointId(item.text, index, sanitizedSource),
-        vector: embeddings[index],
-        payload: {
-          ...item.metadata,
-          text: sanitizedText,
-          chunk_index: item.articleChunkIndex,
-          total_chunks: articleTotalChunks.get(item.documentId) ?? 1,
-          keywords: allKeywords.join(' '),
-          char_count: sanitizedText.length,
-          created_at: timestamp,
-          source: sanitizedSource,
-        },
-      }
-    })
-
-    // 5. Single Qdrant upsert for all points
-    const upsertStart = Date.now()
-    await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, { points })
     logger.info(
-      `[RAG] Qdrant upsert of ${points.length} points completed in ${Date.now() - upsertStart}ms`
+      `[RAG] Batch embedded and stored ${totalUpserted} chunks (${failedChunks} failed during preparation)`
     )
 
-    logger.info(
-      `[RAG] Batch embedded and stored ${prepared.length} chunks (${failedChunks} failed during preparation)`
-    )
-
-    return { totalChunks: prepared.length, failedChunks }
+    return { totalChunks: totalUpserted, failedChunks }
   }
 
   public async embedAndStoreText(

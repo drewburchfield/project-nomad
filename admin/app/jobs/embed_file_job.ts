@@ -437,7 +437,9 @@ export class EmbedFileJob {
         state.total_articles = update.totalArticles ?? null
       }
       if (update.failedArticlePaths && update.failedArticlePaths.length > 0) {
-        state.failed_article_paths = [...state.failed_article_paths, ...update.failedArticlePaths]
+        const combined = [...state.failed_article_paths, ...update.failedArticlePaths]
+        // Cap at 500 entries to prevent unbounded growth on highly corrupt ZIM files
+        state.failed_article_paths = combined.length > 500 ? combined.slice(-500) : combined
       }
       state.status = update.status
 
