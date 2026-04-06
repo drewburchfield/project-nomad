@@ -579,9 +579,11 @@ export class RagService {
       )
     }
 
-    // Count unique articles processed in this batch
-    const articlesInBatch = new Set(zimChunks.map((c) => c.documentId)).size
-    const hasMoreBatches = zimChunks.length === ZIM_BATCH_SIZE
+    // Use the extraction service's articlesProcessed count (includes failed articles)
+    // for accurate offset advancement. Using chunk-derived counts would undercount
+    // when articles fail, causing an infinite re-processing loop.
+    const articlesInBatch = extractionResult.articlesProcessed
+    const hasMoreBatches = extractionResult.articlesProcessed === ZIM_BATCH_SIZE
 
     logger.info(
       `[RAG] Successfully embedded ${totalChunks} total chunks from ${articlesInBatch} articles (hasMore: ${hasMoreBatches}, failedArticles: ${failedArticles}, failedChunks: ${failedChunks})`

@@ -109,8 +109,12 @@ export class EmbedFileJob {
 
       if (!result.success) {
         logger.error(`[EmbedFileJob] Failed to process file ${fileName}: ${result.message}`)
-        // Unsupported file types will never succeed on retry — fail immediately
-        if (result.message?.toLowerCase().includes('unsupported')) {
+        // Permanent failures will never succeed on retry — fail immediately
+        const permanentFailures = [
+          'Unsupported file type.',
+          'Process completed succesfully, but no text was found to embed.',
+        ]
+        if (permanentFailures.some((msg) => result.message === msg)) {
           throw new UnrecoverableError(result.message)
         }
         throw new Error(result.message)
@@ -226,7 +230,7 @@ export class EmbedFileJob {
     const existing = await queue.getJob(jobId)
     if (existing) {
       const state = await existing.getState()
-      if (state === 'completed' || state === 'failed') {
+      if (state === 'completed' || state === 'failed' || state === 'unknown') {
         logger.info(`[EmbedFileJob] Removing stale ${state} job ${jobId} for: ${params.fileName}`)
         await existing.remove()
       } else if (state === 'active' || state === 'waiting' || state === 'delayed') {
