@@ -134,6 +134,8 @@ export class EmbedFileJob {
           status: 'batch_completed',
           lastBatchAt: Date.now(),
           chunks: (job.data.chunks || 0) + (result.chunks || 0),
+          failedArticles: (job.data.failedArticles || 0) + (result.failedArticles || 0),
+          failedChunks: (job.data.failedChunks || 0) + (result.failedChunks || 0),
         })
 
         return {
@@ -149,12 +151,16 @@ export class EmbedFileJob {
 
       // Final batch or non-batched file - mark as complete
       const totalChunks = (job.data.chunks || 0) + (result.chunks || 0)
+      const totalFailedArticles = (job.data.failedArticles || 0) + (result.failedArticles || 0)
+      const totalFailedChunks = (job.data.failedChunks || 0) + (result.failedChunks || 0)
       await this.safeUpdateProgress(job, 100)
       await job.updateData({
         ...job.data,
         status: 'completed',
         completedAt: Date.now(),
         chunks: totalChunks,
+        failedArticles: totalFailedArticles,
+        failedChunks: totalFailedChunks,
       })
 
       const batchMsg = isZimBatch ? ` (final batch, total chunks: ${totalChunks})` : ''

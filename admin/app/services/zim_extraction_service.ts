@@ -2,11 +2,36 @@ import { Archive, Entry } from '@openzim/libzim'
 import * as cheerio from 'cheerio'
 import { HTML_SELECTORS_TO_REMOVE, NON_CONTENT_HEADING_PATTERNS } from '../../constants/zim_extraction.js'
 import logger from '@adonisjs/core/services/logger'
-import { ExtractZIMChunkingStrategy, ExtractZIMContentOptions, ZIMContentChunk, ZIMArchiveMetadata } from '../../types/zim.js'
+import { ExtractZIMChunkingStrategy, ExtractZIMContentOptions, ZIMContentChunk, ZIMArchiveMetadata, ZIMExtractionResult } from '../../types/zim.js'
 import { randomUUID } from 'node:crypto'
-import { access } from 'node:fs/promises'
+import { access, open } from 'node:fs/promises'
+
+// ZIM file magic number: 72173914 (little-endian) = 0x44D495A
+// In file bytes: 5A 49 4D 04
+const ZIM_MAGIC_BYTES = Buffer.from([0x5a, 0x49, 0x4d, 0x04])
 
 export class ZIMExtractionService {
+
+    /**
+     * Validates a ZIM file by checking its magic number before passing to libzim.
+     * Corrupted ZIM files cause a native C++ abort in @openzim/libzim that bypasses
+     * JS try/catch and kills the worker process. This check prevents that.
+     */
+    private async validateZIMMagicNumber(filePath: string): Promise<void> {
+        const fh = await open(filePath, 'r')
+        try {
+            const buf = Buffer.alloc(4)
+            const { bytesRead } = await fh.read(buf, 0, 4, 0)
+            if (bytesRead < 4 || !buf.equals(ZIM_MAGIC_BYTES)) {
+                throw new Error(
+                    `Invalid or corrupt ZIM file (bad magic number): ${filePath}. ` +
+                    `Expected ${ZIM_MAGIC_BYTES.toString('hex')}, got ${buf.slice(0, bytesRead).toString('hex')}`
+                )
+            }
+        } finally {
+            await fh.close()
+        }
+    }
 
     private extractArchiveMetadata(archive: Archive): ZIMArchiveMetadata {
         try {
@@ -39,10 +64,10 @@ export class ZIMExtractionService {
      * @param filePath - Path to the ZIM file
      * @param opts - Options including maxArticles, strategy, onProgress, startOffset, and batchSize
      */
-    async extractZIMContent(filePath: string, opts: ExtractZIMContentOptions = {}): Promise<ZIMContentChunk[]> {
+    async extractZIMContent(filePath: string, opts: ExtractZIMContentOptions = {}): Promise<ZIMExtractionResult> {
         try {
             logger.info(`[ZIMExtractionService]: Processing ZIM file at path: ${filePath}`)
-            
+
             // defensive - check if file still exists before opening
             // could have been deleted by another process or batch
             try {
@@ -51,7 +76,11 @@ export class ZIMExtractionService {
                 logger.error(`[ZIMExtractionService]: ZIM file not accessible: ${filePath}`)
                 throw new Error(`ZIM file not found or not accessible: ${filePath}`)
             }
-            
+
+            // Validate magic number before passing to libzim.
+            // Corrupt ZIM files cause a native C++ abort that kills the worker process.
+            await this.validateZIMMagicNumber(filePath)
+
             const archive = new Archive(filePath)
 
             // Extract archive-level metadata once
@@ -59,6 +88,7 @@ export class ZIMExtractionService {
             logger.info(`[ZIMExtractionService]: Archive metadata - Title: ${archiveMetadata.title}, Language: ${archiveMetadata.language}`)
 
             let articlesProcessed = 0
+            let failedArticles = 0
             let articlesSkipped = 0
             const processedPaths = new Set<string>()
             const toReturn: ZIMContentChunk[] = []
@@ -91,54 +121,63 @@ export class ZIMExtractionService {
                 }
                 processedPaths.add(entry.path)
 
-                const item = entry.item
-                const blob = item.data
-                const html = this.getCleanedHTMLString(blob.data)
+                try {
+                    const item = entry.item
+                    const blob = item.data
+                    const html = this.getCleanedHTMLString(blob.data)
 
-                const strategy = opts.strategy || this.chooseChunkingStrategy(html);
-                logger.debug(`[ZIMExtractionService]: Chosen chunking strategy for path ${entry.path}: ${strategy}`)
+                    const strategy = opts.strategy || this.chooseChunkingStrategy(html);
+                    logger.debug(`[ZIMExtractionService]: Chosen chunking strategy for path ${entry.path}: ${strategy}`)
 
-                // Generate a unique document ID. All chunks from same article will share it
-                const documentId = randomUUID()
-                const articleTitle = entry.title || entry.path
+                    // Generate a unique document ID. All chunks from same article will share it
+                    const documentId = randomUUID()
+                    const articleTitle = entry.title || entry.path
 
-                let chunks: ZIMContentChunk[]
+                    let chunks: ZIMContentChunk[]
 
-                if (strategy === 'structured') {
-                    const structured = this.extractStructuredContent(html)
-                    chunks = structured.sections.map(s => ({
-                        text: s.text,
-                        articleTitle,
-                        articlePath: entry.path,
-                        sectionTitle: s.heading,
-                        fullTitle: `${articleTitle} - ${s.heading}`,
-                        hierarchy: `${articleTitle} > ${s.heading}`,
-                        sectionLevel: s.level,
-                        documentId,
-                        archiveMetadata,
-                        strategy,
-                    }))
-                } else {
-                    // Simple strategy - entire article as one chunk
-                    const text = this.extractTextFromHTML(html) || ''
-                    chunks = [{
-                        text,
-                        articleTitle,
-                        articlePath: entry.path,
-                        sectionTitle: articleTitle, // Same as article for simple strategy
-                        fullTitle: articleTitle,
-                        hierarchy: articleTitle,
-                        documentId,
-                        archiveMetadata,
-                        strategy,
-                    }]
+                    if (strategy === 'structured') {
+                        const structured = this.extractStructuredContent(html)
+                        chunks = structured.sections.map(s => ({
+                            text: s.text,
+                            articleTitle,
+                            articlePath: entry.path,
+                            sectionTitle: s.heading,
+                            fullTitle: `${articleTitle} - ${s.heading}`,
+                            hierarchy: `${articleTitle} > ${s.heading}`,
+                            sectionLevel: s.level,
+                            documentId,
+                            archiveMetadata,
+                            strategy,
+                        }))
+                    } else {
+                        // Simple strategy - entire article as one chunk
+                        const text = this.extractTextFromHTML(html) || ''
+                        chunks = [{
+                            text,
+                            articleTitle,
+                            articlePath: entry.path,
+                            sectionTitle: articleTitle, // Same as article for simple strategy
+                            fullTitle: articleTitle,
+                            hierarchy: articleTitle,
+                            documentId,
+                            archiveMetadata,
+                            strategy,
+                        }]
+                    }
+
+                    logger.debug(`Extracted ${chunks.length} chunks from article at path: ${entry.path} using strategy: ${strategy}`)
+
+                    const nonEmptyChunks = chunks.filter(c => c.text.trim().length > 0)
+                    logger.debug(`After filtering empty chunks, ${nonEmptyChunks.length} chunks remain for article at path: ${entry.path}`)
+                    toReturn.push(...nonEmptyChunks)
+                } catch (articleError) {
+                    failedArticles++
+                    logger.error(
+                        `[ZIMExtractionService]: Failed to extract article at path: ${entry.path}`,
+                        articleError
+                    )
                 }
 
-                logger.debug(`Extracted ${chunks.length} chunks from article at path: ${entry.path} using strategy: ${strategy}`)
-
-                const nonEmptyChunks = chunks.filter(c => c.text.trim().length > 0)
-                logger.debug(`After filtering empty chunks, ${nonEmptyChunks.length} chunks remain for article at path: ${entry.path}`)
-                toReturn.push(...nonEmptyChunks)
                 articlesProcessed++
 
                 if (opts.onProgress) {
@@ -146,7 +185,13 @@ export class ZIMExtractionService {
                 }
             }
 
-            logger.info(`[ZIMExtractionService]: Completed processing ZIM file. Total articles processed: ${articlesProcessed}`)
+            if (failedArticles > 0) {
+                logger.warn(
+                    `[ZIMExtractionService]: Completed with ${failedArticles} failed articles out of ${articlesProcessed} processed`
+                )
+            }
+
+            logger.info(`[ZIMExtractionService]: Completed processing ZIM file. Total articles processed: ${articlesProcessed}, failed: ${failedArticles}`)
             logger.debug("Final structured content sample:", toReturn.slice(0, 3).map(c => ({
                 articleTitle: c.articleTitle,
                 sectionTitle: c.sectionTitle,
@@ -154,7 +199,7 @@ export class ZIMExtractionService {
                 textPreview: c.text.substring(0, 100)
             })))
             logger.debug("Total structured sections extracted:", toReturn.length)
-            return toReturn
+            return { chunks: toReturn, articlesProcessed, failedArticles }
         } catch (error) {
             logger.error('Error processing ZIM file:', error)
             throw error

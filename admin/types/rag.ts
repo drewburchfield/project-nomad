@@ -14,6 +14,8 @@ export type ProcessAndEmbedFileResponse = {
   hasMoreBatches?: boolean
   articlesProcessed?: number
   totalArticles?: number
+  failedArticles?: number
+  failedChunks?: number
 }
 export type ProcessZIMFileResponse = ProcessAndEmbedFileResponse
 

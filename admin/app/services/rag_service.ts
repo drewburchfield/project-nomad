@@ -481,10 +481,18 @@ export class RagService {
       `[RAG] Extracting ZIM content (batch: offset=${startOffset}, size=${ZIM_BATCH_SIZE})`
     )
 
-    const zimChunks = await zimExtractionService.extractZIMContent(filepath, {
+    const extractionResult = await zimExtractionService.extractZIMContent(filepath, {
       startOffset,
       batchSize: ZIM_BATCH_SIZE,
     })
+
+    const { chunks: zimChunks, failedArticles } = extractionResult
+
+    if (failedArticles > 0) {
+      logger.warn(
+        `[RAG] ZIM extraction had ${failedArticles} failed articles out of ${extractionResult.articlesProcessed}`
+      )
+    }
 
     logger.info(
       `[RAG] Extracted ${zimChunks.length} chunks from ZIM file with enhanced metadata`
@@ -492,39 +500,49 @@ export class RagService {
 
     // Process each chunk individually with its metadata
     let totalChunks = 0
+    let failedChunks = 0
     for (let i = 0; i < zimChunks.length; i++) {
       const zimChunk = zimChunks[i]
-      const result = await this.embedAndStoreText(zimChunk.text, {
-        source: filepath,
-        content_type: 'zim_article',
 
-        // Article-level context
-        article_title: zimChunk.articleTitle,
-        article_path: zimChunk.articlePath,
+      try {
+        const result = await this.embedAndStoreText(zimChunk.text, {
+          source: filepath,
+          content_type: 'zim_article',
 
-        // Section-level context
-        section_title: zimChunk.sectionTitle,
-        full_title: zimChunk.fullTitle,
-        hierarchy: zimChunk.hierarchy,
-        section_level: zimChunk.sectionLevel,
+          // Article-level context
+          article_title: zimChunk.articleTitle,
+          article_path: zimChunk.articlePath,
 
-        // Use the same document ID for all chunks from the same article for grouping in search results
-        document_id: zimChunk.documentId,
+          // Section-level context
+          section_title: zimChunk.sectionTitle,
+          full_title: zimChunk.fullTitle,
+          hierarchy: zimChunk.hierarchy,
+          section_level: zimChunk.sectionLevel,
 
-        // Archive metadata
-        archive_title: zimChunk.archiveMetadata.title,
-        archive_creator: zimChunk.archiveMetadata.creator,
-        archive_publisher: zimChunk.archiveMetadata.publisher,
-        archive_date: zimChunk.archiveMetadata.date,
-        archive_language: zimChunk.archiveMetadata.language,
-        archive_description: zimChunk.archiveMetadata.description,
+          // Use the same document ID for all chunks from the same article for grouping in search results
+          document_id: zimChunk.documentId,
 
-        // Extraction metadata - not overly relevant for search, but could be useful for debugging and future features...
-        extraction_strategy: zimChunk.strategy,
-      })
+          // Archive metadata
+          archive_title: zimChunk.archiveMetadata.title,
+          archive_creator: zimChunk.archiveMetadata.creator,
+          archive_publisher: zimChunk.archiveMetadata.publisher,
+          archive_date: zimChunk.archiveMetadata.date,
+          archive_language: zimChunk.archiveMetadata.language,
+          archive_description: zimChunk.archiveMetadata.description,
 
-      if (result) {
-        totalChunks += result.chunks
+          // Extraction metadata - not overly relevant for search, but could be useful for debugging and future features...
+          extraction_strategy: zimChunk.strategy,
+        })
+
+        if (result) {
+          totalChunks += result.chunks
+        }
+      } catch (chunkError) {
+        failedChunks++
+        logger.error(
+          `[RAG] Failed to embed chunk from article "${zimChunk.articleTitle}" (path: ${zimChunk.articlePath}, section: ${zimChunk.sectionTitle})`,
+          chunkError
+        )
       }
 
       if (onProgress) {
@@ -532,12 +550,18 @@ export class RagService {
       }
     }
 
+    if (failedChunks > 0) {
+      logger.warn(
+        `[RAG] ${failedChunks} chunks failed to embed out of ${zimChunks.length} total`
+      )
+    }
+
     // Count unique articles processed in this batch
     const articlesInBatch = new Set(zimChunks.map((c) => c.documentId)).size
     const hasMoreBatches = zimChunks.length === ZIM_BATCH_SIZE
 
     logger.info(
-      `[RAG] Successfully embedded ${totalChunks} total chunks from ${articlesInBatch} articles (hasMore: ${hasMoreBatches})`
+      `[RAG] Successfully embedded ${totalChunks} total chunks from ${articlesInBatch} articles (hasMore: ${hasMoreBatches}, failedArticles: ${failedArticles}, failedChunks: ${failedChunks})`
     )
 
     // Only delete the file when:
@@ -560,6 +584,8 @@ export class RagService {
       chunks: totalChunks,
       hasMoreBatches,
       articlesProcessed: articlesInBatch,
+      failedArticles,
+      failedChunks,
     }
   }
 
