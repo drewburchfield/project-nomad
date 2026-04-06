@@ -107,7 +107,7 @@ export class RagService {
         field_schema: 'keyword',
       })
     } catch (error) {
-      logger.error('Error ensuring Qdrant collection:', error)
+      logger.error('[RAG] Error ensuring Qdrant collection:', error)
       throw error
     }
   }
@@ -427,9 +427,13 @@ export class RagService {
 
       logger.debug(`[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batch.length} chunks)`)
 
+      const embedStart = Date.now()
       const response = await this.ollamaService.embed(
         this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL,
         batch
+      )
+      logger.info(
+        `[RAG] Embed batch ${batchIdx + 1}/${totalBatches} completed in ${Date.now() - embedStart}ms`
       )
 
       embeddings.push(...response.embeddings)
@@ -476,7 +480,11 @@ export class RagService {
     })
 
     // 5. Single Qdrant upsert for all points
+    const upsertStart = Date.now()
     await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, { points })
+    logger.info(
+      `[RAG] Qdrant upsert of ${points.length} points completed in ${Date.now() - upsertStart}ms`
+    )
 
     logger.info(
       `[RAG] Batch embedded and stored ${prepared.length} chunks (${failedChunks} failed during preparation)`
@@ -584,9 +592,13 @@ export class RagService {
             `[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batchPrefixed.length} chunks)`
           )
 
+          const embedStart = Date.now()
           const response = await this.ollamaService.embed(
             this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL,
             batchPrefixed
+          )
+          logger.info(
+            `[RAG] Embed batch ${batchIdx + 1}/${totalBatches} completed in ${Date.now() - embedStart}ms`
           )
 
           const points = batchChunks.map((chunkText, i) => {
@@ -628,7 +640,11 @@ export class RagService {
             }
           })
 
+          const upsertStart = Date.now()
           await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, { points })
+          logger.info(
+            `[RAG] Qdrant upsert of ${points.length} points completed in ${Date.now() - upsertStart}ms`
+          )
           succeededChunks += batchChunks.length
         } catch (batchError) {
           failedChunks += batchChunks.length
@@ -657,7 +673,6 @@ export class RagService {
 
       return { chunks: succeededChunks, failedChunks }
     } catch (error) {
-      console.error(error)
       logger.error('[RAG] Error embedding text:', error)
       return null
     }
@@ -1312,7 +1327,7 @@ export class RagService {
 
       return Array.from(sources)
     } catch (error) {
-      logger.error('Error retrieving stored files:', error)
+      logger.error('[RAG] Error retrieving stored files:', error)
       return []
     }
   }
@@ -1415,7 +1430,7 @@ export class RagService {
         message: `Nomad docs discovery completed. Dispatched ${filesToEmbed.length} embedding jobs.`,
       }
     } catch (error) {
-      logger.error('Error discovering Nomad docs:', error)
+      logger.error('[RAG] Error discovering Nomad docs:', error)
       return { success: false, message: 'Error discovering Nomad docs.' }
     }
   }

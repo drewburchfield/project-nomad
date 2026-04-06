@@ -47,10 +47,14 @@ export class EmbedFileJob {
 
   async handle(job: Job) {
     const { filePath, fileName, batchOffset, totalArticles } = job.data as EmbedFileJobParams
+    const jobId = job.id ?? 'unknown'
 
     const isZimBatch = batchOffset !== undefined
     const batchInfo = isZimBatch ? ` (batch offset: ${batchOffset})` : ''
-    logger.info(`[EmbedFileJob] Starting embedding process for: ${fileName}${batchInfo}`)
+    logger.info(
+      `[EmbedFileJob] job=${jobId} file=${fileName} Starting embedding process${batchInfo}`
+    )
+    const jobStart = Date.now()
 
     const dockerService = new DockerService()
     const ollamaService = new OllamaService()
@@ -62,7 +66,11 @@ export class EmbedFileJob {
       // retrying 30x when the service doesn't exist just wastes Redis connections
       const ollamaUrl = await dockerService.getServiceURL('nomad_ollama')
       if (!ollamaUrl) {
-        logger.warn('[EmbedFileJob] Ollama is not installed. Skipping embedding for: %s', fileName)
+        logger.warn(
+          '[EmbedFileJob] job=%s Ollama is not installed. Skipping embedding for: %s',
+          jobId,
+          fileName
+        )
         throw new UnrecoverableError(
           'Ollama service is not installed. Install AI Assistant to enable file embeddings.'
         )
@@ -70,19 +78,23 @@ export class EmbedFileJob {
 
       const existingModels = await ollamaService.getModels()
       if (!existingModels) {
-        logger.warn('[EmbedFileJob] Ollama service not ready yet. Will retry...')
+        logger.warn('[EmbedFileJob] job=%s Ollama service not ready yet. Will retry...', jobId)
         throw new Error('Ollama service not ready yet')
       }
 
       const qdrantUrl = await dockerService.getServiceURL('nomad_qdrant')
       if (!qdrantUrl) {
-        logger.warn('[EmbedFileJob] Qdrant is not installed. Skipping embedding for: %s', fileName)
+        logger.warn(
+          '[EmbedFileJob] job=%s Qdrant is not installed. Skipping embedding for: %s',
+          jobId,
+          fileName
+        )
         throw new UnrecoverableError(
           'Qdrant service is not installed. Install AI Assistant to enable file embeddings.'
         )
       }
 
-      logger.info(`[EmbedFileJob] Services ready. Processing file: ${fileName}`)
+      logger.info(`[EmbedFileJob] job=${jobId} Services ready. Processing file: ${fileName}`)
 
       // Update progress starting
       await this.safeUpdateProgress(job, 5)
@@ -92,7 +104,7 @@ export class EmbedFileJob {
         startedAt: job.data.startedAt || Date.now(),
       })
 
-      logger.info(`[EmbedFileJob] Processing file: ${filePath}`)
+      logger.info(`[EmbedFileJob] job=${jobId} Processing file: ${filePath}`)
 
       // Progress callback: maps service-reported 0-100% into the 5-95% job range
       const onProgress = async (percent: number) => {
@@ -110,7 +122,9 @@ export class EmbedFileJob {
       )
 
       if (!result.success) {
-        logger.error(`[EmbedFileJob] Failed to process file ${fileName}: ${result.message}`)
+        logger.error(
+          `[EmbedFileJob] job=${jobId} Failed to process file ${fileName}: ${result.message}`
+        )
         // Permanent failures will never succeed on retry — fail immediately
         const permanentFailures = [
           'Unsupported file type.',
@@ -125,7 +139,9 @@ export class EmbedFileJob {
       // For ZIM files with batching, check if more batches are needed
       if (result.hasMoreBatches) {
         const nextOffset = (batchOffset || 0) + (result.articlesProcessed || 0)
-        logger.info(`[EmbedFileJob] Batch complete. Dispatching next batch at offset ${nextOffset}`)
+        logger.info(
+          `[EmbedFileJob] job=${jobId} Batch complete. Dispatching next batch at offset ${nextOffset}`
+        )
 
         // Persist indexing state to database
         await EmbedFileJob.updateZimIndexingState(filePath, {
@@ -195,8 +211,9 @@ export class EmbedFileJob {
       }
 
       const batchMsg = isZimBatch ? ` (final batch, total chunks: ${totalChunks})` : ''
+      const elapsed = Date.now() - jobStart
       logger.info(
-        `[EmbedFileJob] Successfully embedded ${result.chunks} chunks from file: ${fileName}${batchMsg}`
+        `[EmbedFileJob] job=${jobId} Successfully embedded ${result.chunks} chunks from file: ${fileName}${batchMsg} (${elapsed}ms)`
       )
 
       return {
@@ -207,7 +224,10 @@ export class EmbedFileJob {
         message: `Successfully embedded ${result.chunks} chunks`,
       }
     } catch (error) {
-      logger.error(`[EmbedFileJob] Error embedding file ${fileName}:`, error)
+      logger.error(
+        `[EmbedFileJob] job=${jobId} Error embedding file ${fileName} (${Date.now() - jobStart}ms):`,
+        error
+      )
 
       await job.updateData({
         ...job.data,

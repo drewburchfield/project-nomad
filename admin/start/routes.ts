@@ -135,6 +135,7 @@ router.get('/api/chat/suggestions', [ChatsController, 'suggestions'])
 
 router
   .group(() => {
+    router.get('/health', [RagController, 'health'])
     router.post('/upload', [RagController, 'upload'])
     router.get('/files', [RagController, 'getStoredFiles'])
     router.delete('/files', [RagController, 'deleteFile'])
