@@ -24,6 +24,7 @@ import { randomUUID } from 'node:crypto'
 import { join, resolve, sep } from 'node:path'
 import KVStore from '#models/kv_store'
 import { ZIMExtractionService } from './zim_extraction_service.js'
+import type { ZIMContentChunk } from '../../types/zim.js'
 import { ZIM_BATCH_SIZE } from '../../constants/zim_extraction.js'
 import pipelineConfig from '#config/pipeline'
 import {
@@ -248,6 +249,195 @@ export class RagService {
       .filter((word) => word.length > 2)
 
     return [...new Set(keywords)]
+  }
+
+  /**
+   * Batch-embed an array of ZIMContentChunks with a single model verification,
+   * batched Ollama embed calls, and a single Qdrant upsert.
+   * Each chunk's per-article metadata is preserved on every resulting point.
+   */
+  public async batchEmbedAndStore(
+    zimChunks: ZIMContentChunk[],
+    filepath: string,
+    onProgress?: (percent: number) => Promise<void>
+  ): Promise<{ totalChunks: number; failedChunks: number }> {
+    await this._ensureCollection(RagService.CONTENT_COLLECTION_NAME, RagService.EMBEDDING_DIMENSION)
+
+    // 1. Verify embedding model once for the entire batch
+    if (!this.embeddingModelVerified) {
+      const allModels = await this.ollamaService.getModels(true)
+      const embeddingModel =
+        allModels.find((model) => model.name === RagService.EMBEDDING_MODEL) ??
+        allModels.find((model) => model.name.toLowerCase().includes('nomic-embed-text'))
+
+      if (!embeddingModel) {
+        try {
+          const downloadResult = await this.ollamaService.downloadModel(RagService.EMBEDDING_MODEL)
+          if (!downloadResult.success) {
+            throw new Error(downloadResult.message || 'Unknown error during model download')
+          }
+        } catch (modelError) {
+          logger.error(
+            `[RAG] Embedding model ${RagService.EMBEDDING_MODEL} not found locally and failed to download:`,
+            modelError
+          )
+          this.embeddingModelVerified = false
+          throw modelError
+        }
+      }
+      this.resolvedEmbeddingModel = embeddingModel?.name ?? RagService.EMBEDDING_MODEL
+      this.embeddingModelVerified = true
+    }
+
+    // 2. Prepare all chunks: split oversized text, prefix, and track metadata per sub-chunk
+    const targetCharsPerChunk = Math.floor(
+      RagService.TARGET_TOKENS_PER_CHUNK * RagService.CHAR_TO_TOKEN_RATIO
+    )
+    const overlapChars = Math.floor(150 * RagService.CHAR_TO_TOKEN_RATIO)
+
+    type PreparedChunk = {
+      text: string // raw text (for payload)
+      prefixed: string // prefixed text (for embedding)
+      metadata: Record<string, any>
+    }
+
+    const prepared: PreparedChunk[] = []
+    let failedChunks = 0
+
+    for (const zimChunk of zimChunks) {
+      try {
+        const metadata: Record<string, any> = {
+          source: filepath,
+          content_type: 'zim_article',
+          article_title: zimChunk.articleTitle,
+          article_path: zimChunk.articlePath,
+          section_title: zimChunk.sectionTitle,
+          full_title: zimChunk.fullTitle,
+          hierarchy: zimChunk.hierarchy,
+          section_level: zimChunk.sectionLevel,
+          document_id: zimChunk.documentId,
+          archive_title: zimChunk.archiveMetadata.title,
+          archive_creator: zimChunk.archiveMetadata.creator,
+          archive_publisher: zimChunk.archiveMetadata.publisher,
+          archive_date: zimChunk.archiveMetadata.date,
+          archive_language: zimChunk.archiveMetadata.language,
+          archive_description: zimChunk.archiveMetadata.description,
+          extraction_strategy: zimChunk.strategy,
+        }
+
+        const estimatedTokens = this.estimateTokenCount(zimChunk.text)
+
+        let textParts: string[]
+
+        if (estimatedTokens > RagService.TARGET_TOKENS_PER_CHUNK) {
+          // Chunk is too large for a single embedding; re-chunk it
+          const chunker = await TokenChunker.create({
+            chunkSize: targetCharsPerChunk,
+            chunkOverlap: overlapChars,
+          })
+          const chunkResults = await chunker.chunk(zimChunk.text)
+          textParts = chunkResults.map((c) => c.text)
+        } else {
+          textParts = [zimChunk.text]
+        }
+
+        for (const partText of textParts) {
+          let text = partText
+          const prefixText = RagService.SEARCH_DOCUMENT_PREFIX
+          const withPrefix = prefixText + text
+          const estTokens = this.estimateTokenCount(withPrefix)
+
+          if (estTokens > RagService.MAX_SAFE_TOKENS) {
+            const prefixTokens = this.estimateTokenCount(prefixText)
+            text = this.truncateToTokenLimit(text, RagService.MAX_SAFE_TOKENS - prefixTokens)
+          }
+
+          prepared.push({
+            text,
+            prefixed: RagService.SEARCH_DOCUMENT_PREFIX + text,
+            metadata,
+          })
+        }
+      } catch (chunkError) {
+        failedChunks++
+        logger.error(
+          `[RAG] Failed to prepare chunk from article "${zimChunk.articleTitle}" (path: ${zimChunk.articlePath}, section: ${zimChunk.sectionTitle})`,
+          chunkError
+        )
+      }
+    }
+
+    if (prepared.length === 0) {
+      return { totalChunks: 0, failedChunks }
+    }
+
+    // 3. Batch embed all prepared chunks through Ollama
+    const embeddings: number[][] = []
+    const batchSize = RagService.EMBEDDING_BATCH_SIZE
+    const totalBatches = Math.ceil(prepared.length / batchSize)
+
+    for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
+      const batchStart = batchIdx * batchSize
+      const batch = prepared.slice(batchStart, batchStart + batchSize).map((p) => p.prefixed)
+
+      logger.debug(`[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batch.length} chunks)`)
+
+      const response = await this.ollamaService.embed(
+        this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL,
+        batch
+      )
+
+      embeddings.push(...response.embeddings)
+
+      if (onProgress) {
+        const progress = ((batchStart + batch.length) / prepared.length) * 100
+        await onProgress(progress)
+      }
+    }
+
+    // 4. Build Qdrant points with per-chunk metadata
+    const timestamp = Date.now()
+    const points = prepared.map((item, index) => {
+      const sanitizedText = this.sanitizeText(item.text)
+      const contentKeywords = this.extractKeywords(sanitizedText)
+
+      let structuralKeywords: string[] = []
+      if (item.metadata.full_title) {
+        structuralKeywords = this.extractKeywords(item.metadata.full_title as string)
+      } else if (item.metadata.article_title) {
+        structuralKeywords = this.extractKeywords(item.metadata.article_title as string)
+      }
+
+      const allKeywords = [...new Set([...structuralKeywords, ...contentKeywords])]
+      const sanitizedSource =
+        typeof item.metadata.source === 'string'
+          ? this.sanitizeText(item.metadata.source)
+          : 'unknown'
+
+      return {
+        id: randomUUID(),
+        vector: embeddings[index],
+        payload: {
+          ...item.metadata,
+          text: sanitizedText,
+          chunk_index: index,
+          total_chunks: prepared.length,
+          keywords: allKeywords.join(' '),
+          char_count: sanitizedText.length,
+          created_at: timestamp,
+          source: sanitizedSource,
+        },
+      }
+    })
+
+    // 5. Single Qdrant upsert for all points
+    await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, { points })
+
+    logger.info(
+      `[RAG] Batch embedded and stored ${prepared.length} chunks (${failedChunks} failed during preparation)`
+    )
+
+    return { totalChunks: prepared.length, failedChunks }
   }
 
   public async embedAndStoreText(
@@ -515,66 +705,17 @@ export class RagService {
       )
     }
 
-    logger.info(
-      `[RAG] Extracted ${zimChunks.length} chunks from ZIM file with enhanced metadata`
+    logger.info(`[RAG] Extracted ${zimChunks.length} chunks from ZIM file with enhanced metadata`)
+
+    // Batch-embed all chunks: single model verification, batched Ollama calls, single Qdrant upsert
+    const { totalChunks, failedChunks } = await this.batchEmbedAndStore(
+      zimChunks,
+      filepath,
+      onProgress
     )
 
-    // Process each chunk individually with its metadata
-    let totalChunks = 0
-    let failedChunks = 0
-    for (let i = 0; i < zimChunks.length; i++) {
-      const zimChunk = zimChunks[i]
-
-      try {
-        const result = await this.embedAndStoreText(zimChunk.text, {
-          source: filepath,
-          content_type: 'zim_article',
-
-          // Article-level context
-          article_title: zimChunk.articleTitle,
-          article_path: zimChunk.articlePath,
-
-          // Section-level context
-          section_title: zimChunk.sectionTitle,
-          full_title: zimChunk.fullTitle,
-          hierarchy: zimChunk.hierarchy,
-          section_level: zimChunk.sectionLevel,
-
-          // Use the same document ID for all chunks from the same article for grouping in search results
-          document_id: zimChunk.documentId,
-
-          // Archive metadata
-          archive_title: zimChunk.archiveMetadata.title,
-          archive_creator: zimChunk.archiveMetadata.creator,
-          archive_publisher: zimChunk.archiveMetadata.publisher,
-          archive_date: zimChunk.archiveMetadata.date,
-          archive_language: zimChunk.archiveMetadata.language,
-          archive_description: zimChunk.archiveMetadata.description,
-
-          // Extraction metadata - not overly relevant for search, but could be useful for debugging and future features...
-          extraction_strategy: zimChunk.strategy,
-        })
-
-        if (result) {
-          totalChunks += result.chunks
-        }
-      } catch (chunkError) {
-        failedChunks++
-        logger.error(
-          `[RAG] Failed to embed chunk from article "${zimChunk.articleTitle}" (path: ${zimChunk.articlePath}, section: ${zimChunk.sectionTitle})`,
-          chunkError
-        )
-      }
-
-      if (onProgress) {
-        await onProgress(((i + 1) / zimChunks.length) * 100)
-      }
-    }
-
     if (failedChunks > 0) {
-      logger.warn(
-        `[RAG] ${failedChunks} chunks failed to embed out of ${zimChunks.length} total`
-      )
+      logger.warn(`[RAG] ${failedChunks} chunks failed to embed out of ${zimChunks.length} total`)
     }
 
     // Use the extraction service's articlesProcessed count (includes failed articles)
@@ -1353,7 +1494,9 @@ export class RagService {
         }
       }
 
-      logger.info(`[RAG] Sync complete: ${queuedCount} queued, ${skippedCount} skipped (already in progress)`)
+      logger.info(
+        `[RAG] Sync complete: ${queuedCount} queued, ${skippedCount} skipped (already in progress)`
+      )
 
       return {
         success: true,
