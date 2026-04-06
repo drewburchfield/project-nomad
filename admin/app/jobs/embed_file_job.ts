@@ -301,24 +301,39 @@ export class EmbedFileJob {
       }
     }
 
-    const job = await queue.add(this.key, params, {
-      jobId,
-      attempts: pipelineConfig.embedMaxRetries,
-      backoff: {
-        type: 'fixed',
-        delay: pipelineConfig.embedRetryDelay,
-      },
-      removeOnComplete: { count: 50 }, // Keep last 50 completed jobs for history
-      removeOnFail: { count: 20 }, // Keep last 20 failed jobs for debugging
-    })
+    try {
+      const job = await queue.add(this.key, params, {
+        jobId,
+        attempts: pipelineConfig.embedMaxRetries,
+        backoff: {
+          type: 'fixed',
+          delay: pipelineConfig.embedRetryDelay,
+        },
+        removeOnComplete: { count: 50 }, // Keep last 50 completed jobs for history
+        removeOnFail: { count: 20 }, // Keep last 20 failed jobs for debugging
+      })
 
-    logger.info(`[EmbedFileJob] Dispatched job ${jobId} for file: ${params.fileName}`)
+      logger.info(`[EmbedFileJob] Dispatched job ${jobId} for file: ${params.fileName}`)
 
-    return {
-      job,
-      created: true,
-      jobId,
-      message: `File queued for embedding: ${params.fileName}`,
+      return {
+        job,
+        created: true,
+        jobId,
+        message: `File queued for embedding: ${params.fileName}`,
+      }
+    } catch (error: any) {
+      // Handle race condition: another caller may have re-created the job between our remove and add
+      if (error.message?.includes('job already exists')) {
+        const current = await queue.getJob(jobId)
+        logger.info(`[EmbedFileJob] Job ${jobId} was re-created by another caller for: ${params.fileName}`)
+        return {
+          job: current,
+          created: false,
+          jobId,
+          message: `Embedding job already exists for: ${params.fileName}`,
+        }
+      }
+      throw error
     }
   }
 

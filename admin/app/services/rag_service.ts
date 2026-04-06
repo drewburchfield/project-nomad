@@ -1,3 +1,4 @@
+import { DateTime } from 'luxon'
 import { QdrantClient } from '@qdrant/js-client-rest'
 import { DockerService } from './docker_service.js'
 import { inject } from '@adonisjs/core'
@@ -130,7 +131,8 @@ export class RagService {
 
       const info = await this.qdrant.getCollection(RagService.CONTENT_COLLECTION_NAME)
       return (info.points_count || 0) > 0
-    } catch {
+    } catch (error) {
+      logger.warn('[RAG] hasDocuments() failed, RAG will be skipped for this request:', error)
       return false
     }
   }
@@ -433,57 +435,66 @@ export class RagService {
       const batchStart = batchIdx * batchSize
       const batchItems = prepared.slice(batchStart, batchStart + batchSize)
 
-      logger.debug(`[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batchItems.length} chunks)`)
+      try {
+        logger.debug(`[RAG] Embedding batch ${batchIdx + 1}/${totalBatches} (${batchItems.length} chunks)`)
 
-      const embedStart = Date.now()
-      const response = await this.ollamaService.embed(
-        this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL,
-        batchItems.map((p) => p.prefixed)
-      )
-      logger.info(
-        `[RAG] Embed batch ${batchIdx + 1}/${totalBatches} completed in ${Date.now() - embedStart}ms`
-      )
+        const embedStart = Date.now()
+        const response = await this.ollamaService.embed(
+          this.resolvedEmbeddingModel ?? RagService.EMBEDDING_MODEL,
+          batchItems.map((p) => p.prefixed)
+        )
+        logger.info(
+          `[RAG] Embed batch ${batchIdx + 1}/${totalBatches} completed in ${Date.now() - embedStart}ms`
+        )
 
-      // Build and upsert points for this batch immediately
-      const points = batchItems.map((item, i) => {
-        const sanitizedText = this.sanitizeText(item.text)
-        const contentKeywords = this.extractKeywords(sanitizedText)
+        // Build and upsert points for this batch immediately
+        const points = batchItems.map((item, i) => {
+          const sanitizedText = this.sanitizeText(item.text)
+          const contentKeywords = this.extractKeywords(sanitizedText)
 
-        let structuralKeywords: string[] = []
-        if (item.metadata.full_title) {
-          structuralKeywords = this.extractKeywords(item.metadata.full_title as string)
-        } else if (item.metadata.article_title) {
-          structuralKeywords = this.extractKeywords(item.metadata.article_title as string)
-        }
+          let structuralKeywords: string[] = []
+          if (item.metadata.full_title) {
+            structuralKeywords = this.extractKeywords(item.metadata.full_title as string)
+          } else if (item.metadata.article_title) {
+            structuralKeywords = this.extractKeywords(item.metadata.article_title as string)
+          }
 
-        const allKeywords = [...new Set([...structuralKeywords, ...contentKeywords])]
-        const sanitizedSource =
-          typeof item.metadata.source === 'string'
-            ? this.sanitizeText(item.metadata.source)
-            : 'unknown'
+          const allKeywords = [...new Set([...structuralKeywords, ...contentKeywords])]
+          const sanitizedSource =
+            typeof item.metadata.source === 'string'
+              ? this.sanitizeText(item.metadata.source)
+              : 'unknown'
 
-        return {
-          id: this.generatePointId(item.text, item.articleChunkIndex, sanitizedSource, item.metadata.article_path),
-          vector: response.embeddings[i],
-          payload: {
-            ...item.metadata,
-            text: sanitizedText,
-            chunk_index: item.articleChunkIndex,
-            total_chunks: articleTotalChunks.get(item.documentId) ?? 1,
-            keywords: allKeywords.join(' '),
-            char_count: sanitizedText.length,
-            created_at: timestamp,
-            source: sanitizedSource,
-          },
-        }
-      })
+          return {
+            id: this.generatePointId(item.text, item.articleChunkIndex, sanitizedSource, item.metadata.article_path),
+            vector: response.embeddings[i],
+            payload: {
+              ...item.metadata,
+              text: sanitizedText,
+              chunk_index: item.articleChunkIndex,
+              total_chunks: articleTotalChunks.get(item.documentId) ?? 1,
+              keywords: allKeywords.join(' '),
+              char_count: sanitizedText.length,
+              created_at: timestamp,
+              source: sanitizedSource,
+            },
+          }
+        })
 
-      const upsertStart = Date.now()
-      await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, { points })
-      totalUpserted += points.length
-      logger.info(
-        `[RAG] Qdrant upsert of ${points.length} points completed in ${Date.now() - upsertStart}ms`
-      )
+        const upsertStart = Date.now()
+        await this.qdrant!.upsert(RagService.CONTENT_COLLECTION_NAME, { points })
+        totalUpserted += points.length
+        logger.info(
+          `[RAG] Qdrant upsert of ${points.length} points completed in ${Date.now() - upsertStart}ms`
+        )
+      } catch (batchError) {
+        failedChunks += batchItems.length
+        const preview = batchItems[0]?.text.substring(0, 80) ?? '(empty)'
+        logger.error(
+          `[RAG] Batch ${batchIdx + 1}/${totalBatches} failed (${batchItems.length} chunks lost), preview: "${preview}..."`,
+          batchError
+        )
+      }
 
       if (onProgress) {
         const progress = ((batchStart + batchItems.length) / prepared.length) * 100
@@ -1025,7 +1036,8 @@ export class RagService {
       )
     } catch (error) {
       logger.error('[RAG] Error processing and embedding file:', error)
-      return { success: false, message: 'Error processing and embedding file.' }
+      const detail = error instanceof Error ? error.message : 'Unknown error'
+      return { success: false, message: `Error processing and embedding file: ${detail}` }
     }
   }
 
@@ -1547,9 +1559,21 @@ export class RagService {
         'failed',
       ])
 
-      // Add partial ZIM files that aren't already in the filesToEmbed list
+      // Add partial ZIM files that aren't already in the filesToEmbed list.
+      // Detect stale 'in_progress' states (stuck longer than 2x lock duration) and force re-queue.
+      const staleDurationMs = 2 * pipelineConfig.queueLockDuration
       const filesToEmbedSet = new Set(filesToEmbed)
       for (const state of partialZimStates) {
+        const isStale = state.status === 'in_progress'
+          && state.updated_at
+          && DateTime.now().diff(state.updated_at).milliseconds > staleDurationMs
+
+        if (isStale) {
+          logger.warn(
+            `[RAG] ZIM indexing state for ${state.file_path} is stale (last updated: ${state.updated_at}), forcing re-queue`
+          )
+        }
+
         if (!filesToEmbedSet.has(state.file_path)) {
           filesToEmbed.push(state.file_path)
           filesToEmbedSet.add(state.file_path)

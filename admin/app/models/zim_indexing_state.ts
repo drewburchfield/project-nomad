@@ -23,7 +23,13 @@ export default class ZimIndexingState extends BaseModel {
     prepare: (value: string[]) => JSON.stringify(value),
     consume: (value: string) => {
       if (!value) return []
-      return typeof value === 'string' ? JSON.parse(value) : value
+      if (typeof value !== 'string') return Array.isArray(value) ? value : []
+      try {
+        const parsed = JSON.parse(value)
+        return Array.isArray(parsed) ? parsed : []
+      } catch {
+        return []
+      }
     },
   })
   declare failed_article_paths: string[]

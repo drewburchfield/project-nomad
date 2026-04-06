@@ -31,7 +31,7 @@ export default class RagController {
       this.checkQueue(queueService),
     ])
 
-    const healthy = ollama.reachable && qdrant.reachable
+    const healthy = ollama.reachable && qdrant.reachable && queue.reachable
     return response.status(healthy ? 200 : 503).json({
       status: healthy ? 'healthy' : 'degraded',
       ollama,
@@ -52,7 +52,7 @@ export default class RagController {
       const modelLoaded = models.some((m) => m.name.toLowerCase().includes('nomic-embed-text'))
       return { reachable: true, modelLoaded }
     } catch (error) {
-      logger.debug(
+      logger.warn(
         '[RAG:health] Ollama check failed: %s',
         error instanceof Error ? error.message : error
       )
@@ -83,7 +83,7 @@ export default class RagController {
 
       return { reachable: true, collectionExists: exists, documentCount }
     } catch (error) {
-      logger.debug(
+      logger.warn(
         '[RAG:health] Qdrant check failed: %s',
         error instanceof Error ? error.message : error
       )
@@ -93,22 +93,23 @@ export default class RagController {
 
   private async checkQueue(
     queueService: QueueService
-  ): Promise<{ active: number; waiting: number; delayed: number; failed: number }> {
+  ): Promise<{ reachable: boolean; active: number; waiting: number; delayed: number; failed: number }> {
     try {
       const queue = queueService.getQueue(EmbedFileJob.queue)
       const counts = await queue.getJobCounts('active', 'waiting', 'delayed', 'failed')
       return {
+        reachable: true,
         active: counts.active ?? 0,
         waiting: counts.waiting ?? 0,
         delayed: counts.delayed ?? 0,
         failed: counts.failed ?? 0,
       }
     } catch (error) {
-      logger.debug(
+      logger.warn(
         '[RAG:health] Queue check failed: %s',
         error instanceof Error ? error.message : error
       )
-      return { active: 0, waiting: 0, delayed: 0, failed: 0 }
+      return { reachable: false, active: 0, waiting: 0, delayed: 0, failed: 0 }
     }
   }
 
