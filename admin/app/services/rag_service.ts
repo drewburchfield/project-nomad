@@ -113,6 +113,26 @@ export class RagService {
   }
 
   /**
+   * Returns true if the knowledge base contains at least one indexed document.
+   * Used to short-circuit RAG search and query rewriting when the KB is empty.
+   */
+  async hasDocuments(): Promise<boolean> {
+    try {
+      await this._ensureDependencies()
+      const collections = await this.qdrant!.getCollections()
+      const exists = collections.collections.some(
+        (col) => col.name === RagService.CONTENT_COLLECTION_NAME
+      )
+      if (!exists) return false
+
+      const info = await this.qdrant!.getCollection(RagService.CONTENT_COLLECTION_NAME)
+      return (info.points_count || 0) > 0
+    } catch {
+      return false
+    }
+  }
+
+  /**
    * Sanitizes text to ensure it's safe for JSON encoding and Qdrant storage.
    * Removes problematic characters that can cause "unexpected end of hex escape" errors:
    * - Null bytes (\x00)

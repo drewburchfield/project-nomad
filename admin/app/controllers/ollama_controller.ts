@@ -8,7 +8,7 @@ import { modelNameSchema } from '#validators/download'
 import { chatSchema, getAvailableModelsSchema } from '#validators/ollama'
 import { inject } from '@adonisjs/core'
 import type { HttpContext } from '@adonisjs/core/http'
-import { DEFAULT_QUERY_REWRITE_MODEL, RAG_CONTEXT_LIMITS, SYSTEM_PROMPTS } from '../../constants/ollama.js'
+import { RAG_CONTEXT_LIMITS, SYSTEM_PROMPTS } from '../../constants/ollama.js'
 import { SERVICE_NAMES } from '../../constants/service_names.js'
 import logger from '@adonisjs/core/services/logger'
 type Message = { role: 'system' | 'user' | 'assistant'; content: string }
@@ -57,9 +57,19 @@ export default class OllamaController {
         reqData.messages.unshift(systemPrompt)
       }
 
+      // Skip RAG entirely when the knowledge base has no documents.
+      // This avoids unnecessary query rewriting inference and Qdrant calls.
+      const kbHasDocuments = await this.ragService.hasDocuments()
+
+      if (!kbHasDocuments) {
+        logger.debug('[OllamaController] Knowledge base is empty, skipping RAG pipeline')
+      }
+
       // Query rewriting for better RAG retrieval with manageable context
       // Will return user's latest message if no rewriting is needed
-      const rewrittenQuery = await this.rewriteQueryWithContext(reqData.messages)
+      const rewrittenQuery = kbHasDocuments
+        ? await this.rewriteQueryWithContext(reqData.messages, reqData.model)
+        : null
 
       logger.debug(`[OllamaController] Rewritten query for RAG: "${rewrittenQuery}"`)
       if (rewrittenQuery) {
@@ -157,7 +167,7 @@ export default class OllamaController {
           await this.chatService.addMessage(sessionId, 'assistant', fullContent)
           const messageCount = await this.chatService.getMessageCount(sessionId)
           if (messageCount <= 2 && userContent) {
-            this.chatService.generateTitle(sessionId, userContent, fullContent).catch((err) => {
+            this.chatService.generateTitle(sessionId, userContent, fullContent, reqData.model).catch((err) => {
               logger.error(`[OllamaController] Title generation failed: ${err instanceof Error ? err.message : err}`)
             })
           }
@@ -172,7 +182,7 @@ export default class OllamaController {
         await this.chatService.addMessage(sessionId, 'assistant', result.message.content)
         const messageCount = await this.chatService.getMessageCount(sessionId)
         if (messageCount <= 2 && userContent) {
-          this.chatService.generateTitle(sessionId, userContent, result.message.content).catch((err) => {
+          this.chatService.generateTitle(sessionId, userContent, result.message.content, reqData.model).catch((err) => {
             logger.error(`[OllamaController] Title generation failed: ${err instanceof Error ? err.message : err}`)
           })
         }
@@ -312,7 +322,8 @@ export default class OllamaController {
   }
 
   private async rewriteQueryWithContext(
-    messages: Message[]
+    messages: Message[],
+    model: string
   ): Promise<string | null> {
     try {
       // Get recent conversation history (last 6 messages for 3 turns)
@@ -336,17 +347,10 @@ export default class OllamaController {
         })
         .join('\n')
 
-      const installedModels = await this.ollamaService.getModels(true)
-      const rewriteModelAvailable = installedModels?.some(model => model.name === DEFAULT_QUERY_REWRITE_MODEL)
-      if (!rewriteModelAvailable) {
-        logger.warn(`[RAG] Query rewrite model "${DEFAULT_QUERY_REWRITE_MODEL}" not available. Skipping query rewriting.`)
-        const lastUserMessage = [...messages].reverse().find(msg => msg.role === 'user')
-        return lastUserMessage?.content || null
-      }
-
-      // FUTURE ENHANCEMENT: allow the user to specify which model to use for rewriting
+      // Use the user's selected chat model for query rewriting to avoid
+      // surprise-loading an additional model that competes for VRAM.
       const response = await this.ollamaService.chat({
-        model: DEFAULT_QUERY_REWRITE_MODEL,
+        model,
         messages: [
           {
             role: 'system',
