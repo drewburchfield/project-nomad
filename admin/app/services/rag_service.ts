@@ -1261,27 +1261,36 @@ export class RagService {
 
       // Dispatch jobs for files that need embedding
       let queuedCount = 0
+      let skippedCount = 0
       for (const filePath of filesToEmbed) {
         try {
           const fileName = filePath.split(/[/\\]/).pop() || filePath
           const stats = await getFileStatsIfExists(filePath)
 
           logger.info(`[RAG] Dispatching embed job for: ${fileName}`)
-          await EmbedFileJob.dispatch({
+          const result = await EmbedFileJob.dispatch({
             filePath: filePath,
             fileName: fileName,
             fileSize: stats?.size,
           })
-          queuedCount++
-          logger.debug(`[RAG] Successfully dispatched job for ${fileName}`)
+
+          if (result.created) {
+            queuedCount++
+            logger.info(`[RAG] Queued job ${result.jobId} for ${fileName}`)
+          } else {
+            skippedCount++
+            logger.info(`[RAG] Skipped ${fileName} (job ${result.jobId} already in progress)`)
+          }
         } catch (fileError) {
           logger.error(`[RAG] Error dispatching job for file ${filePath}:`, fileError)
         }
       }
 
+      logger.info(`[RAG] Sync complete: ${queuedCount} queued, ${skippedCount} skipped (already in progress)`)
+
       return {
         success: true,
-        message: `Scanned ${filesInStorage.length} files, queued ${queuedCount} for embedding`,
+        message: `Scanned ${filesInStorage.length} files, queued ${queuedCount} for embedding${skippedCount > 0 ? `, ${skippedCount} already in progress` : ''}`,
         filesScanned: filesInStorage.length,
         filesQueued: queuedCount,
       }
