@@ -47,9 +47,7 @@ export class RagService {
   public static MAX_SAFE_TOKENS = 1600 // Leave buffer for prefix and tokenization variance
   public static TARGET_TOKENS_PER_CHUNK = 1500 // Target 1500 tokens per chunk for embedding
   public static PREFIX_TOKEN_BUDGET = 10 // Reserve ~10 tokens for prefixes
-  public static CHAR_TO_TOKEN_RATIO = 2 // Conservative chars-per-token estimate; technical docs
-  // (numbers, symbols, abbreviations) tokenize denser
-  // than plain prose (~3), so 2 avoids context overflows
+  public static CHAR_TO_TOKEN_RATIO = pipelineConfig.charToTokenRatio
   // Nomic Embed Text v1.5 uses task-specific prefixes for optimal performance
   public static SEARCH_DOCUMENT_PREFIX = 'search_document: '
   public static SEARCH_QUERY_PREFIX = 'search_query: '

@@ -52,6 +52,13 @@ const pipelineConfig = {
 
   /** Concurrency for embed queue workers (default: 2) */
   embedConcurrency: positiveInt('NOMAD_EMBED_CONCURRENCY', env.get('NOMAD_EMBED_CONCURRENCY'), 2),
+
+  /** Chars-per-token estimate for chunk sizing (default: 3) */
+  charToTokenRatio: positiveInt(
+    'NOMAD_CHAR_TO_TOKEN_RATIO',
+    env.get('NOMAD_CHAR_TO_TOKEN_RATIO'),
+    3
+  ),
 }
 
 export default pipelineConfig
