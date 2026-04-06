@@ -209,38 +209,44 @@ export class EmbedFileJob {
     const queue = queueService.getQueue(this.queue)
     const jobId = this.getJobId(params.filePath)
 
-    try {
-      const job = await queue.add(this.key, params, {
-        jobId,
-        attempts: 30,
-        backoff: {
-          type: 'fixed',
-          delay: 60000, // Check every 60 seconds for service readiness
-        },
-        removeOnComplete: { count: 50 }, // Keep last 50 completed jobs for history
-        removeOnFail: { count: 20 } // Keep last 20 failed jobs for debugging
-      })
-
-      logger.info(`[EmbedFileJob] Dispatched embedding job for file: ${params.fileName}`)
-
-      return {
-        job,
-        created: true,
-        jobId,
-        message: `File queued for embedding: ${params.fileName}`,
-      }
-    } catch (error) {
-      if (error.message && error.message.includes('job already exists')) {
-        const existing = await queue.getJob(jobId)
-        logger.info(`[EmbedFileJob] Job already exists for file: ${params.fileName}`)
+    // Remove stale completed/failed jobs so the same file can be re-queued.
+    // Without this, queue.add() silently collides on the deterministic jobId
+    // and no new work is dispatched (GitHub #388).
+    const existing = await queue.getJob(jobId)
+    if (existing) {
+      const state = await existing.getState()
+      if (state === 'completed' || state === 'failed') {
+        logger.info(`[EmbedFileJob] Removing stale ${state} job ${jobId} for: ${params.fileName}`)
+        await existing.remove()
+      } else if (state === 'active' || state === 'waiting' || state === 'delayed') {
+        logger.info(`[EmbedFileJob] Job ${jobId} already ${state} for: ${params.fileName}`)
         return {
           job: existing,
           created: false,
           jobId,
-          message: `Embedding job already exists for: ${params.fileName}`,
+          message: `Embedding job already ${state} for: ${params.fileName}`,
         }
       }
-      throw error
+    }
+
+    const job = await queue.add(this.key, params, {
+      jobId,
+      attempts: 30,
+      backoff: {
+        type: 'fixed',
+        delay: 60000, // Check every 60 seconds for service readiness
+      },
+      removeOnComplete: { count: 50 }, // Keep last 50 completed jobs for history
+      removeOnFail: { count: 20 }, // Keep last 20 failed jobs for debugging
+    })
+
+    logger.info(`[EmbedFileJob] Dispatched job ${jobId} for file: ${params.fileName}`)
+
+    return {
+      job,
+      created: true,
+      jobId,
+      message: `File queued for embedding: ${params.fileName}`,
     }
   }
 
