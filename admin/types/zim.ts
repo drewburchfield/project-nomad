@@ -70,8 +70,8 @@ export type ExtractZIMContentOptions = {
   maxArticles?: number
   onProgress?: (processedArticles: number, totalArticles: number) => void
   // Batch processing options to avoid lock timeouts
-  startOffset?: number  // Article index to start from for resuming
-  batchSize?: number    // Max articles to process in this batch
+  startOffset?: number // Article index to start from for resuming
+  batchSize?: number // Max articles to process in this batch
 }
 
 export type ExtractZIMChunkingStrategy = 'structured' | 'simple'
@@ -113,4 +113,5 @@ export type ZIMExtractionResult = {
   chunks: ZIMContentChunk[]
   articlesProcessed: number
   failedArticles: number
+  failedArticlePaths: string[]
 }

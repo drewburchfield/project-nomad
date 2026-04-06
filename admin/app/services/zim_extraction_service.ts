@@ -91,6 +91,7 @@ export class ZIMExtractionService {
             let failedArticles = 0
             let articlesSkipped = 0
             const processedPaths = new Set<string>()
+            const failedArticlePaths: string[] = []
             const toReturn: ZIMContentChunk[] = []
 
             // Support batch processing to avoid lock timeouts on large ZIM files
@@ -172,6 +173,7 @@ export class ZIMExtractionService {
                     toReturn.push(...nonEmptyChunks)
                 } catch (articleError) {
                     failedArticles++
+                    failedArticlePaths.push(entry.path)
                     logger.error(
                         `[ZIMExtractionService]: Failed to extract article at path: ${entry.path}`,
                         articleError
@@ -199,7 +201,7 @@ export class ZIMExtractionService {
                 textPreview: c.text.substring(0, 100)
             })))
             logger.debug("Total structured sections extracted:", toReturn.length)
-            return { chunks: toReturn, articlesProcessed, failedArticles }
+            return { chunks: toReturn, articlesProcessed, failedArticles, failedArticlePaths }
         } catch (error) {
             logger.error('Error processing ZIM file:', error)
             throw error
