@@ -8,6 +8,8 @@ import { createHash } from 'node:crypto'
 import logger from '@adonisjs/core/services/logger'
 import fs from 'node:fs/promises'
 import pipelineConfig from '#config/pipeline'
+import ZimIndexingState from '#models/zim_indexing_state'
+import { DateTime } from 'luxon'
 
 export interface EmbedFileJobParams {
   filePath: string
@@ -125,6 +127,15 @@ export class EmbedFileJob {
         const nextOffset = (batchOffset || 0) + (result.articlesProcessed || 0)
         logger.info(`[EmbedFileJob] Batch complete. Dispatching next batch at offset ${nextOffset}`)
 
+        // Persist indexing state to database
+        await EmbedFileJob.updateZimIndexingState(filePath, {
+          articlesProcessed: result.articlesProcessed || 0,
+          lastSuccessfulOffset: nextOffset,
+          totalArticles: totalArticles || result.totalArticles,
+          failedArticlePaths: result.failedArticlePaths || [],
+          status: 'in_progress',
+        })
+
         // Dispatch next batch (not final yet)
         await EmbedFileJob.dispatch({
           filePath,
@@ -172,6 +183,17 @@ export class EmbedFileJob {
         failedChunks: totalFailedChunks,
       })
 
+      // Persist final indexing state for ZIM files
+      if (isZimBatch || filePath.endsWith('.zim')) {
+        await EmbedFileJob.updateZimIndexingState(filePath, {
+          articlesProcessed: result.articlesProcessed || 0,
+          lastSuccessfulOffset: (batchOffset || 0) + (result.articlesProcessed || 0),
+          totalArticles: totalArticles || result.totalArticles,
+          failedArticlePaths: result.failedArticlePaths || [],
+          status: totalFailedArticles > 0 ? 'partial' : 'completed',
+        })
+      }
+
       const batchMsg = isZimBatch ? ` (final batch, total chunks: ${totalChunks})` : ''
       logger.info(
         `[EmbedFileJob] Successfully embedded ${result.chunks} chunks from file: ${fileName}${batchMsg}`
@@ -193,6 +215,18 @@ export class EmbedFileJob {
         failedAt: Date.now(),
         error: error instanceof Error ? error.message : 'Unknown error',
       })
+
+      // Persist failed state for ZIM files
+      if (isZimBatch || filePath.endsWith('.zim')) {
+        await EmbedFileJob.updateZimIndexingState(filePath, {
+          status: 'failed',
+        }).catch((stateError) => {
+          logger.error(
+            `[EmbedFileJob] Failed to update indexing state for ${fileName}:`,
+            stateError
+          )
+        })
+      }
 
       throw error
     }
@@ -333,6 +367,64 @@ export class EmbedFileJob {
       progress: typeof job.progress === 'number' ? job.progress : undefined,
       chunks: data.chunks,
       error: data.error,
+    }
+  }
+
+  /**
+   * Update or create the persistent ZIM indexing state in the database.
+   * Accumulates articles_processed and failed_article_paths across batches.
+   */
+  static async updateZimIndexingState(
+    filePath: string,
+    update: {
+      articlesProcessed?: number
+      lastSuccessfulOffset?: number
+      totalArticles?: number | null
+      failedArticlePaths?: string[]
+      status: 'in_progress' | 'completed' | 'failed' | 'partial'
+    }
+  ): Promise<void> {
+    try {
+      let state = await ZimIndexingState.findBy('file_path', filePath)
+
+      if (!state) {
+        state = await ZimIndexingState.create({
+          file_path: filePath,
+          total_articles: update.totalArticles ?? null,
+          articles_processed: update.articlesProcessed || 0,
+          last_successful_offset: update.lastSuccessfulOffset || 0,
+          failed_article_paths: update.failedArticlePaths || [],
+          status: update.status,
+          started_at: DateTime.now(),
+        })
+        logger.info(
+          `[EmbedFileJob] Created indexing state for ${filePath}: status=${update.status}`
+        )
+        return
+      }
+
+      // Accumulate across batches
+      if (update.articlesProcessed !== undefined) {
+        state.articles_processed += update.articlesProcessed
+      }
+      if (update.lastSuccessfulOffset !== undefined) {
+        state.last_successful_offset = update.lastSuccessfulOffset
+      }
+      if (update.totalArticles !== undefined) {
+        state.total_articles = update.totalArticles ?? null
+      }
+      if (update.failedArticlePaths && update.failedArticlePaths.length > 0) {
+        state.failed_article_paths = [...state.failed_article_paths, ...update.failedArticlePaths]
+      }
+      state.status = update.status
+
+      await state.save()
+      logger.info(
+        `[EmbedFileJob] Updated indexing state for ${filePath}: status=${update.status}, processed=${state.articles_processed}, offset=${state.last_successful_offset}`
+      )
+    } catch (error) {
+      logger.error(`[EmbedFileJob] Failed to persist indexing state for ${filePath}:`, error)
+      throw error
     }
   }
 }

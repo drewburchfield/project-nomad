@@ -15,6 +15,7 @@ export type ProcessAndEmbedFileResponse = {
   articlesProcessed?: number
   totalArticles?: number
   failedArticles?: number
+  failedArticlePaths?: string[]
   failedChunks?: number
 }
 export type ProcessZIMFileResponse = ProcessAndEmbedFileResponse

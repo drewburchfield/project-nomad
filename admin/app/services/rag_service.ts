@@ -23,6 +23,7 @@ import { removeStopwords } from 'stopword'
 import { createHash } from 'node:crypto'
 import { join, resolve, sep } from 'node:path'
 import KVStore from '#models/kv_store'
+import ZimIndexingState from '#models/zim_indexing_state'
 import { ZIMExtractionService } from './zim_extraction_service.js'
 import type { ZIMContentChunk } from '../../types/zim.js'
 import { ZIM_BATCH_SIZE } from '../../constants/zim_extraction.js'
@@ -722,7 +723,7 @@ export class RagService {
       batchSize: ZIM_BATCH_SIZE,
     })
 
-    const { chunks: zimChunks, failedArticles } = extractionResult
+    const { chunks: zimChunks, failedArticles, failedArticlePaths } = extractionResult
 
     if (failedArticles > 0) {
       logger.warn(
@@ -774,6 +775,7 @@ export class RagService {
       hasMoreBatches,
       articlesProcessed: articlesInBatch,
       failedArticles,
+      failedArticlePaths,
       failedChunks,
     }
   }
@@ -1486,6 +1488,32 @@ export class RagService {
 
       logger.info(`[RAG] Found ${filesToEmbed.length} files that need embedding`)
 
+      // Check for partially-indexed ZIM files that need resuming
+      const partialZimStates = await ZimIndexingState.query().whereIn('status', [
+        'in_progress',
+        'partial',
+        'failed',
+      ])
+
+      // Add partial ZIM files that aren't already in the filesToEmbed list
+      const filesToEmbedSet = new Set(filesToEmbed)
+      for (const state of partialZimStates) {
+        if (!filesToEmbedSet.has(state.file_path)) {
+          filesToEmbed.push(state.file_path)
+          filesToEmbedSet.add(state.file_path)
+          logger.info(
+            `[RAG] Found partially-indexed ZIM file: ${state.file_path} (status: ${state.status}, offset: ${state.last_successful_offset})`
+          )
+        }
+      }
+
+      // Build a lookup for quick access to indexing state by file path
+      const zimStateByPath = new Map(partialZimStates.map((s) => [s.file_path, s]))
+
+      // Also check for ZIM files already in Qdrant but not fully indexed
+      const completedZimFiles = await ZimIndexingState.query().where('status', 'completed')
+      const completedZimPaths = new Set(completedZimFiles.map((s) => s.file_path))
+
       if (filesToEmbed.length === 0) {
         return {
           success: true,
@@ -1504,13 +1532,30 @@ export class RagService {
       for (const filePath of filesToEmbed) {
         try {
           const fileName = filePath.split(/[/\\]/).pop() || filePath
+          const isZimFile = filePath.endsWith('.zim')
+
+          // Skip ZIM files that are fully completed in the indexing state table
+          if (isZimFile && completedZimPaths.has(filePath)) {
+            logger.debug(`[RAG] Skipping fully-indexed ZIM file: ${fileName}`)
+            skippedCount++
+            continue
+          }
+
           const stats = await getFileStatsIfExists(filePath)
 
-          logger.info(`[RAG] Dispatching embed job for: ${fileName}`)
+          // For ZIM files with partial state, resume from last offset
+          const zimState = isZimFile ? zimStateByPath.get(filePath) : undefined
+          const resumeOffset = zimState?.last_successful_offset || undefined
+
+          logger.info(
+            `[RAG] Dispatching embed job for: ${fileName}${resumeOffset ? ` (resuming from offset ${resumeOffset})` : ''}`
+          )
           const result = await EmbedFileJob.dispatch({
             filePath: filePath,
             fileName: fileName,
             fileSize: stats?.size,
+            batchOffset: resumeOffset,
+            totalArticles: zimState?.total_articles ?? undefined,
           })
 
           if (result.created) {
@@ -1526,12 +1571,12 @@ export class RagService {
       }
 
       logger.info(
-        `[RAG] Sync complete: ${queuedCount} queued, ${skippedCount} skipped (already in progress)`
+        `[RAG] Sync complete: ${queuedCount} queued, ${skippedCount} skipped (already in progress or completed)`
       )
 
       return {
         success: true,
-        message: `Scanned ${filesInStorage.length} files, queued ${queuedCount} for embedding${skippedCount > 0 ? `, ${skippedCount} already in progress` : ''}`,
+        message: `Scanned ${filesInStorage.length} files, queued ${queuedCount} for embedding${skippedCount > 0 ? `, ${skippedCount} already in progress or completed` : ''}`,
         filesScanned: filesInStorage.length,
         filesQueued: queuedCount,
       }
