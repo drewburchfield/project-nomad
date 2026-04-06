@@ -61,4 +61,17 @@ export default await Env.create(new URL('../', import.meta.url), {
   |----------------------------------------------------------
   */
   NOMAD_API_URL: Env.schema.string.optional(),
+
+  /*
+  |----------------------------------------------------------
+  | Variables for configuring pipeline / queue behavior
+  |----------------------------------------------------------
+  */
+  NOMAD_EMBED_TIMEOUT: Env.schema.number.optional(),
+  NOMAD_EMBED_BATCH_SIZE: Env.schema.number.optional(),
+  NOMAD_ZIM_BATCH_SIZE: Env.schema.number.optional(),
+  NOMAD_EMBED_MAX_RETRIES: Env.schema.number.optional(),
+  NOMAD_EMBED_RETRY_DELAY: Env.schema.number.optional(),
+  NOMAD_QUEUE_LOCK_DURATION: Env.schema.number.optional(),
+  NOMAD_EMBED_CONCURRENCY: Env.schema.number.optional(),
 })
